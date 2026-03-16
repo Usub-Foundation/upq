@@ -12,6 +12,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 
 option(UPQ_POOL_DEBUG OFF)
+option(UPQ_CONN_DBG ON)
 
 add_compile_definitions(DEV_STAGE=${DEV_STAGE})
 
@@ -25,7 +26,7 @@ include(FetchContent)
 FetchContent_Declare(
         uvent
         GIT_REPOSITORY https://github.com/Usub-development/uvent.git
-        GIT_TAG main
+        GIT_TAG debug_pointers_upq
         OVERRIDE_FIND_PACKAGE
 )
 

@@ -33,16 +33,34 @@
 #define UPQ_REFLECT_DEBUG 1
 #endif
 
-#if UPQ_REFLECT_DEBUG
 #include <cstdio>
 #define UPQ_CONN_DBG(fmt, ...) \
     do { std::fprintf(stderr, "[UPQ/conn] " fmt "\n", ##__VA_ARGS__); } while (0)
-#else
-#define UPQ_CONN_DBG(fmt, ...) \
-    do { } while (0)
-#endif
 
 namespace usub::pg {
+    inline std::atomic<uint64_t> g_coro_seq{0};
+
+    struct CoroGuard {
+        uint64_t id;
+        const char *tag;
+
+        explicit CoroGuard(const char *tag_)
+            : id(g_coro_seq.fetch_add(1, std::memory_order_relaxed) + 1)
+              , tag(tag_) {
+            UPQ_CONN_DBG("CORO #%llu [%s] CREATED",
+                         static_cast<unsigned long long>(id), tag);
+        }
+
+        ~CoroGuard() {
+            UPQ_CONN_DBG("CORO #%llu [%s] DESTROYED",
+                         static_cast<unsigned long long>(id), tag);
+        }
+
+        CoroGuard(const CoroGuard &) = delete;
+
+        CoroGuard &operator=(const CoroGuard &) = delete;
+    };
+
     inline void fill_server_error_fields(PGresult *res, QueryResult &out) {
         if (!res) return;
 
@@ -677,6 +695,8 @@ namespace usub::pg {
         template<class T>
         usub::uvent::task::Awaitable<std::vector<T> >
         exec_simple_query_nonblocking(const std::string &sql) {
+            CoroGuard _cg("exec_simple<vec>");
+
             using Fn = usub::uvent::task::Awaitable<usub::pg::QueryResult>
                     (PgConnectionLibpq::*)(const std::string &);
             Fn base = &PgConnectionLibpq::exec_simple_query_nonblocking;
@@ -695,6 +715,8 @@ namespace usub::pg {
         template<class T>
         usub::uvent::task::Awaitable<std::optional<T> >
         exec_simple_query_one_nonblocking(const std::string &sql) {
+            CoroGuard _cg("exec_simple<vec>");
+
             using Fn = usub::uvent::task::Awaitable<usub::pg::QueryResult>
                     (PgConnectionLibpq::*)(const std::string &);
             Fn base = &PgConnectionLibpq::exec_simple_query_nonblocking;
@@ -714,6 +736,8 @@ namespace usub::pg {
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::vector<T> >
         exec_param_query_nonblocking(const std::string &sql, Args &&... args) {
+            CoroGuard _cg("exec_simple<vec>");
+
             usub::pg::QueryResult qr = co_await this->exec_param_query_nonblocking(
                 sql, std::forward<Args>(args)...);
 
@@ -732,6 +756,8 @@ namespace usub::pg {
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::optional<T> >
         exec_param_query_one_nonblocking(const std::string &sql, Args &&... args) {
+            CoroGuard _cg("exec_simple<vec>");
+
             usub::pg::QueryResult qr = co_await this->exec_param_query_nonblocking(
                 sql, std::forward<Args>(args)...);
 
@@ -752,6 +778,8 @@ namespace usub::pg {
                       && !std::is_same_v<std::decay_t<Sql>, std::string>)
         usub::uvent::task::Awaitable<QueryResult>
         exec_param_query_nonblocking(Sql &&sql, Args &&... args) {
+            CoroGuard _cg("exec_simple<vec>");
+
             constexpr size_t actual = detail::count_total_params<Args...>();
             const std::string_view sv(sql);
             const size_t expected = detail::count_pg_params(sv);
@@ -766,6 +794,8 @@ namespace usub::pg {
                       && !std::is_same_v<std::decay_t<Sql>, std::string>)
         usub::uvent::task::Awaitable<std::vector<T> >
         exec_param_query_nonblocking(Sql &&sql, Args &&... args) {
+            CoroGuard _cg("exec_simple<vec>");
+
             constexpr size_t actual = detail::count_total_params<Args...>();
             const std::string_view sv(sql);
             const size_t expected = detail::count_pg_params(sv);
@@ -780,6 +810,8 @@ namespace usub::pg {
                       && !std::is_same_v<std::decay_t<Sql>, std::string>)
         usub::uvent::task::Awaitable<std::optional<T> >
         exec_param_query_one_nonblocking(Sql &&sql, Args &&... args) {
+            CoroGuard _cg("exec_simple<vec>");
+
             constexpr size_t actual = detail::count_total_params<Args...>();
             const std::string_view sv(sql);
             const size_t expected = detail::count_pg_params(sv);
@@ -850,6 +882,8 @@ namespace usub::pg {
     template<typename... Args>
     usub::uvent::task::Awaitable<QueryResult>
     PgConnectionLibpq::exec_param_query_nonblocking(const std::string &sql, Args &&... args) {
+        CoroGuard _cg("exec_simple<vec>");
+
         QueryResult out{};
         out.ok = false;
         out.rows_affected = 0;

@@ -182,6 +182,8 @@ namespace usub::pg {
 
     usub::uvent::task::Awaitable<QueryResult>
     PgConnectionLibpq::exec_simple_query_nonblocking(const std::string &sql) {
+        CoroGuard _cg("exec_simple<vec>");
+
         QueryResult out{};
         out.ok = false;
         out.code = PgErrorCode::Unknown;
