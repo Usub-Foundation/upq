@@ -42,14 +42,12 @@ namespace usub::pg {
         if (hint && *hint) { out.error.append(" hint: ").append(hint); }
     }
 
-    // ---- ctor/dtor ----
     PgConnectionLibpq::PgConnectionLibpq() = default;
 
     PgConnectionLibpq::~PgConnectionLibpq() {
         this->close();
     }
 
-    // ---- connect ----
     usub::uvent::task::Awaitable<std::optional<std::string> >
     PgConnectionLibpq::connect_async(const std::string &conninfo) {
         using namespace std::chrono_literals;
@@ -65,8 +63,37 @@ namespace usub::pg {
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + clamped;
 
+        auto has_connect_timeout = [](std::string_view ci) {
+            size_t i = 0;
+            while (i < ci.size()) {
+                while (i < ci.size() && (ci[i] == ' ' || ci[i] == '\t')) ++i;
+                if (i >= ci.size()) break;
+
+                size_t key_start = i;
+                while (i < ci.size() && ci[i] != '=' && ci[i] != ' ') ++i;
+                std::string_view key(ci.data() + key_start, i - key_start);
+
+                if (i >= ci.size() || ci[i] != '=') break;
+                ++i; // skip '='
+
+                if (i < ci.size() && ci[i] == '\'') {
+                    ++i;
+                    while (i < ci.size()) {
+                        if (ci[i] == '\\' && i + 1 < ci.size()) { i += 2; continue; }
+                        if (ci[i] == '\'') { ++i; break; }
+                        ++i;
+                    }
+                } else {
+                    while (i < ci.size() && ci[i] != ' ' && ci[i] != '\t') ++i;
+                }
+
+                if (key == "connect_timeout") return true;
+            }
+            return false;
+        };
+
         std::string conninfo_with_to = conninfo;
-        if (conninfo_with_to.find("connect_timeout") == std::string::npos) {
+        if (!has_connect_timeout(conninfo_with_to)) {
             auto secs = std::chrono::duration_cast<std::chrono::seconds>(clamped).count();
             if (secs <= 0) secs = 1;
             conninfo_with_to += " connect_timeout=" + std::to_string(secs);
@@ -462,6 +489,20 @@ namespace usub::pg {
         }
     }
 
+    static bool is_safe_cursor_ident(const std::string &s) {
+        if (s.empty() || s.size() > 63) return false;
+        auto c0 = static_cast<unsigned char>(s[0]);
+        if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
+            return false;
+        for (size_t i = 1; i < s.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
     std::string PgConnectionLibpq::make_cursor_name() {
         const uint64_t seq = ++cursor_seq_;
         char buf[64];
@@ -471,6 +512,14 @@ namespace usub::pg {
 
     usub::uvent::task::Awaitable<QueryResult>
     PgConnectionLibpq::cursor_declare(const std::string &cursor_name, const std::string &sql) {
+        if (!is_safe_cursor_ident(cursor_name)) {
+            QueryResult err{};
+            err.ok = false;
+            err.code = PgErrorCode::ProtocolCorrupt;
+            err.error = "invalid cursor name";
+            err.rows_valid = false;
+            co_return err;
+        }
         std::string full = "BEGIN; DECLARE " + cursor_name + " NO SCROLL CURSOR FOR " + sql + ";";
         co_return co_await exec_simple_query_nonblocking(full);
     }
@@ -480,6 +529,12 @@ namespace usub::pg {
         PgCursorChunk chunk{};
         chunk.ok = false;
         chunk.code = PgErrorCode::Unknown;
+
+        if (!is_safe_cursor_ident(cursor_name)) {
+            chunk.code = PgErrorCode::ProtocolCorrupt;
+            chunk.error = "invalid cursor name";
+            co_return chunk;
+        }
 
         if (!connected()) {
             chunk.code = PgErrorCode::ConnectionClosed;
@@ -522,6 +577,13 @@ namespace usub::pg {
         final.code = PgErrorCode::Unknown;
         final.rows_valid = true;
         final.rows_affected = 0;
+
+        if (!is_safe_cursor_ident(cursor_name)) {
+            final.code = PgErrorCode::ProtocolCorrupt;
+            final.error = "invalid cursor name";
+            final.rows_valid = false;
+            co_return final;
+        }
 
         if (!connected()) {
             final.code = PgErrorCode::ConnectionClosed;
@@ -572,19 +634,22 @@ namespace usub::pg {
     }
 
     void PgConnectionLibpq::close() {
+        std::lock_guard<std::mutex> lk(close_mtx_);
+
         UPQ_CONN_DBG("close: conn=%p connected=%d", static_cast<void*>(conn_), connected_ ? 1 : 0);
 
         this->connected_ = false;
 
         if (this->sock_) {
             this->sock_->shutdown();
-            this->sock_.reset();
         }
 
         if (this->conn_) {
             PQfinish(this->conn_);
             this->conn_ = nullptr;
         }
+
+        this->sock_.reset();
     }
 
     usub::pg::QueryResult PgConnectionLibpq::drain_all_results() {
@@ -616,7 +681,6 @@ namespace usub::pg {
                         if (c) cols_line += ", ";
                         cols_line += tmp.columns[c];
                     }
-                    // UPQ_CONN_DBG("drain: columns[%d]: %s", ncols, cols_line.c_str());
                 }
 #endif
 

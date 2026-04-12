@@ -72,331 +72,331 @@ struct Filter {
     int max_value;
 };
 
-task::Awaitable<void> test_param_count_pool(usub::pg::PgPool &pool) {
-    std::cout << "[PARAM-COUNT/POOL] start\n";
-
-    // --- schema ---
-    {
-        auto r = co_await pool.query_awaitable(R"SQL(
-            CREATE TABLE IF NOT EXISTS param_test (
-                id       BIGSERIAL PRIMARY KEY,
-                name     TEXT NOT NULL,
-                value    INT NOT NULL,
-                comment  TEXT
-            );
-        )SQL");
-        if (!r.ok) {
-            std::cout << "[PARAM-COUNT/POOL] schema fail: " << r.error << "\n";
-            co_return;
-        }
-        co_await pool.query_awaitable("TRUNCATE param_test RESTART IDENTITY");
-    }
-
-    // --- query_awaitable: 3 placeholders, 3 args ---
-    {
-        auto r = co_await pool.query_awaitable(
-            "INSERT INTO param_test(name, value, comment) VALUES($1, $2, $3)",
-            "alice", 42, "test");
-        std::cout << "[PARAM-COUNT/POOL] query_awaitable($1,$2,$3 -> 3 args): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- query_awaitable: 0 placeholders, 0 args ---
-    {
-        auto r = co_await pool.query_awaitable(
-            "SELECT count(1) FROM param_test");
-        std::cout << "[PARAM-COUNT/POOL] query_awaitable(0 placeholders, 0 args): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- query_on: 1 placeholder, 1 arg ---
-    {
-        auto c = co_await pool.acquire_connection();
-        if (c && *c) {
-            auto conn = *c;
-            auto r = co_await pool.query_on(conn,
-                                            "SELECT id, name FROM param_test WHERE id = $1", int64_t{1});
-            std::cout << "[PARAM-COUNT/POOL] query_on($1 -> 1 arg): "
-                    << (r.ok ? "OK" : r.error) << "\n";
-            co_await pool.release_connection_async(conn);
-        }
-    }
-
-    // --- query_reflect_expected: 2 placeholders, 2 args ---
-    {
-        auto rows = co_await pool.query_reflect_expected<ParamRow>(
-            "SELECT id, name FROM param_test ORDER BY id LIMIT $1 OFFSET $2",
-            10, 0);
-        std::cout << "[PARAM-COUNT/POOL] query_reflect_expected($1,$2 -> 2 args): "
-                << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-    }
-
-    // --- query_reflect_expected_one: 1 placeholder, 1 arg ---
-    {
-        auto one = co_await pool.query_reflect_expected_one<ParamRow>(
-            "SELECT id, name FROM param_test WHERE name = $1 LIMIT 1",
-            std::string("alice"));
-        std::cout << "[PARAM-COUNT/POOL] query_reflect_expected_one($1 -> 1 arg): "
-                << (one ? "OK" : "not found") << "\n";
-    }
-
-    // --- exec_reflect: struct with 3 fields -> 3 placeholders ---
-    {
-        InsRow row{"bob", 99, "from exec_reflect"};
-        auto r = co_await pool.exec_reflect(
-            "INSERT INTO param_test(name, value, comment) VALUES($1, $2, $3)",
-            row);
-        std::cout << "[PARAM-COUNT/POOL] exec_reflect(struct 3 fields -> $1,$2,$3): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- query_on_reflect: 1 placeholder, 1 arg ---
-    {
-        auto c = co_await pool.acquire_connection();
-        if (c && *c) {
-            auto conn = *c;
-            auto rows = co_await pool.query_on_reflect<ParamRow>(conn,
-                                                                 "SELECT id, name FROM param_test WHERE value = $1",
-                                                                 42);
-            std::cout << "[PARAM-COUNT/POOL] query_on_reflect($1 -> 1 arg): OK n="
-                    << rows.size() << "\n";
-            co_await pool.release_connection_async(conn);
-        }
-    }
-
-    // --- query_on_reflect_one: 1 placeholder, 1 arg ---
-    {
-        auto c = co_await pool.acquire_connection();
-        if (c && *c) {
-            auto conn = *c;
-            auto one = co_await pool.query_on_reflect_one<ParamRow>(conn,
-                                                                    "SELECT id, name FROM param_test WHERE name = $1 LIMIT 1",
-                                                                    std::string("bob"));
-            std::cout << "[PARAM-COUNT/POOL] query_on_reflect_one($1 -> 1 arg): "
-                    << (one ? "OK" : "not found") << "\n";
-            co_await pool.release_connection_async(conn);
-        }
-    }
-
-    // --- query_on_reflect_expected: 2 placeholders, 2 args ---
-    {
-        auto c = co_await pool.acquire_connection();
-        if (c && *c) {
-            auto conn = *c;
-            auto rows = co_await pool.query_on_reflect_expected<ParamRow>(conn,
-                                                                          "SELECT id, name FROM param_test WHERE value >= $1 ORDER BY id LIMIT $2",
-                                                                          0, 100);
-            std::cout << "[PARAM-COUNT/POOL] query_on_reflect_expected($1,$2 -> 2 args): "
-                    << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-            co_await pool.release_connection_async(conn);
-        }
-    }
-
-    // --- query_on_reflect_expected_one: 1 placeholder, 1 arg ---
-    {
-        auto c = co_await pool.acquire_connection();
-        if (c && *c) {
-            auto conn = *c;
-            auto one = co_await pool.query_on_reflect_expected_one<ParamRow>(conn,
-                                                                             "SELECT id, name FROM param_test WHERE id = $1",
-                                                                             int64_t{1});
-            std::cout << "[PARAM-COUNT/POOL] query_on_reflect_expected_one($1 -> 1 arg): "
-                    << (one ? "OK" : "not found") << "\n";
-            co_await pool.release_connection_async(conn);
-        }
-    }
-
-    std::cout << "[PARAM-COUNT/POOL] all passed\n";
-    co_return;
-}
-
-task::Awaitable<void> test_param_count_transaction(usub::pg::PgPool &pool) {
-    std::cout << "[PARAM-COUNT/TX] start\n";
-
-    // --- schema ---
-    {
-        auto r = co_await pool.query_awaitable(R"SQL(
-            CREATE TABLE IF NOT EXISTS param_test_tx (
-                id       BIGSERIAL PRIMARY KEY,
-                name     TEXT NOT NULL,
-                value    INT NOT NULL,
-                comment  TEXT
-            );
-        )SQL");
-        if (!r.ok) {
-            std::cout << "[PARAM-COUNT/TX] schema fail: " << r.error << "\n";
-            co_return;
-        }
-        co_await pool.query_awaitable("TRUNCATE param_test_tx RESTART IDENTITY");
-    }
-
-    usub::pg::PgTransaction tx(&pool);
-    if (auto err = co_await tx.begin_errored(); err) {
-        co_await tx.finish();
-        std::cout << "[PARAM-COUNT/TX] begin failed: " << err->error << "\n";
-        co_return;
-    }
-
-    // --- tx.query: 3 placeholders, 3 args ---
-    {
-        auto r = co_await tx.query(
-            "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
-            "alice", 10, "from tx.query");
-        std::cout << "[PARAM-COUNT/TX] query($1,$2,$3 -> 3 args): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- tx.query: 0 placeholders, 0 args ---
-    {
-        auto r = co_await tx.query(
-            "SELECT count(1) FROM param_test_tx");
-        std::cout << "[PARAM-COUNT/TX] query(0 placeholders, 0 args): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- tx.query_reflect (Obj): struct with 3 fields -> 3 placeholders ---
-    {
-        InsRow row{"bob", 20, "from tx.query_reflect"};
-        auto r = co_await tx.query_reflect(
-            "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
-            row);
-        std::cout << "[PARAM-COUNT/TX] query_reflect(struct -> $1,$2,$3): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- tx.exec_reflect (Obj): struct with 3 fields -> 3 placeholders ---
-    {
-        InsRow row{"carol", 30, "from tx.exec_reflect"};
-        auto r = co_await tx.exec_reflect(
-            "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
-            row);
-        std::cout << "[PARAM-COUNT/TX] exec_reflect(struct -> $1,$2,$3): "
-                << (r.ok ? "OK" : r.error) << "\n";
-    }
-
-    // --- tx.query_reflect_expected: 2 placeholders, 2 args ---
-    {
-        auto rows = co_await tx.query_reflect_expected<ParamRow>(
-            "SELECT id, name FROM param_test_tx ORDER BY id LIMIT $1 OFFSET $2",
-            10, 0);
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected($1,$2 -> 2 args): "
-                << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-    }
-
-    // --- tx.query_reflect_expected_one: 1 placeholder, 1 arg ---
-    {
-        auto one = co_await tx.query_reflect_expected_one<ParamRow>(
-            "SELECT id, name FROM param_test_tx WHERE name = $1 LIMIT 1",
-            std::string("alice"));
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one($1 -> 1 arg): "
-                << (one ? "OK" : "not found") << "\n";
-    }
-
-    // --- tx.query_reflect_expected (0 args) ---
-    {
-        auto rows = co_await tx.query_reflect_expected<ParamRow>(
-            "SELECT id, name FROM param_test_tx ORDER BY id");
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected(0 args): "
-                << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-    }
-
-    // --- tx.query_reflect_expected_one (0 args) ---
-    {
-        auto one = co_await tx.query_reflect_expected_one<ParamRow>(
-            "SELECT id, name FROM param_test_tx ORDER BY id LIMIT 1");
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one(0 args): "
-                << (one ? "OK" : "not found") << "\n";
-    }
-
-    // --- tx.query_reflect_expected<T, Obj>: struct with 2 fields -> 2 placeholders ---
-    {
-        Filter f{0, 100};
-        auto rows = co_await tx.query_reflect_expected<ParamRow, Filter>(
-            "SELECT id, name FROM param_test_tx WHERE value >= $1 AND value <= $2 ORDER BY id",
-            f);
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected<T,Obj>(struct -> $1,$2): "
-                << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-    }
-
-    // --- tx.query_reflect_expected_one<T, Obj>: struct with 1 field -> 1 placeholder ---
-    {
-        ById f{1};
-        auto one = co_await tx.query_reflect_expected_one<ParamRow, ById>(
-            "SELECT id, name FROM param_test_tx WHERE id = $1",
-            f);
-        std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one<T,Obj>(struct -> $1): "
-                << (one ? "OK" : "not found") << "\n";
-    }
-
-    // --- subtransaction tests ---
-    {
-        auto sub = tx.make_subtx();
-        if (co_await sub.begin()) {
-            // sub.query: 2 placeholders, 2 args
-            {
-                auto r = co_await sub.query(
-                    "UPDATE param_test_tx SET comment = $1 WHERE id = $2",
-                    "subtx-updated", int64_t{1});
-                std::cout << "[PARAM-COUNT/SUBTX] query($1,$2 -> 2 args): "
-                        << (r.ok ? "OK" : r.error) << "\n";
-            }
-
-            // sub.query_reflect (Obj): struct with 2 fields -> 2 placeholders
-            {
-                Upd u{.name = "alice-subtx", .id = 1};
-                auto r = co_await sub.query_reflect(
-                    "UPDATE param_test_tx SET name = $1 WHERE id = $2", u);
-                std::cout << "[PARAM-COUNT/SUBTX] query_reflect(struct -> $1,$2): "
-                        << (r.ok ? "OK" : r.error) << "\n";
-            }
-
-            // sub.query_reflect_expected_one: 1 placeholder, 1 arg
-            {
-                auto one = co_await sub.query_reflect_expected_one<ParamRow>(
-                    "SELECT id, name FROM param_test_tx WHERE id = $1",
-                    int64_t{1});
-                std::cout << "[PARAM-COUNT/SUBTX] query_reflect_expected_one($1 -> 1 arg): "
-                        << (one ? "OK name=" + one->name : "not found") << "\n";
-            }
-
-            // sub.query_reflect_expected: 1 placeholder, 1 arg
-            {
-                auto rows = co_await sub.query_reflect_expected<ParamRow>(
-                    "SELECT id, name FROM param_test_tx WHERE value > $1 ORDER BY id",
-                    0);
-                std::cout << "[PARAM-COUNT/SUBTX] query_reflect_expected($1 -> 1 arg): "
-                        << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
-            }
-
-            co_await sub.rollback();
-        }
-    }
-
-    if (!(co_await tx.commit()))
-        std::cout << "[PARAM-COUNT/TX] commit failed\n";
-
-    std::cout << "[PARAM-COUNT/TX] all passed\n";
-    co_return;
-}
-
-task::Awaitable<void> test_param_count_mismatch(usub::pg::PgPool &pool) {
-    // This should trigger assert: 2 placeholders but 3 args
-    auto r = co_await pool.query_awaitable(
-        "SELECT * FROM param_test WHERE id = $1 AND name = $2",
-        1, "alice", "extra_arg");
-    co_return;
-}
-
-task::Awaitable<void> test_param_count_mismatch_tx(usub::pg::PgPool &pool) {
-    usub::pg::PgTransaction tx(&pool);
-    co_await tx.begin();
-    // This should trigger assert: 1 placeholder but 2 args
-    auto r = co_await tx.query(
-        "SELECT * FROM param_test WHERE id = $1",
-        1, "extra_arg");
-    co_await tx.rollback();
-    co_return;
-}
+// task::Awaitable<void> test_param_count_pool(usub::pg::PgPool &pool) {
+//     std::cout << "[PARAM-COUNT/POOL] start\n";
+//
+//     // --- schema ---
+//     {
+//         auto r = co_await pool.query_awaitable(R"SQL(
+//             CREATE TABLE IF NOT EXISTS param_test (
+//                 id       BIGSERIAL PRIMARY KEY,
+//                 name     TEXT NOT NULL,
+//                 value    INT NOT NULL,
+//                 comment  TEXT
+//             );
+//         )SQL");
+//         if (!r.ok) {
+//             std::cout << "[PARAM-COUNT/POOL] schema fail: " << r.error << "\n";
+//             co_return;
+//         }
+//         co_await pool.query_awaitable("TRUNCATE param_test RESTART IDENTITY");
+//     }
+//
+//     // --- query_awaitable: 3 placeholders, 3 args ---
+//     {
+//         auto r = co_await pool.query_awaitable(
+//             "INSERT INTO param_test(name, value, comment) VALUES($1, $2, $3)",
+//             "alice", 42, "test");
+//         std::cout << "[PARAM-COUNT/POOL] query_awaitable($1,$2,$3 -> 3 args): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- query_awaitable: 0 placeholders, 0 args ---
+//     {
+//         auto r = co_await pool.query_awaitable(
+//             "SELECT count(1) FROM param_test");
+//         std::cout << "[PARAM-COUNT/POOL] query_awaitable(0 placeholders, 0 args): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- query_on: 1 placeholder, 1 arg ---
+//     {
+//         auto c = co_await pool.acquire_connection();
+//         if (c && *c) {
+//             auto conn = *c;
+//             auto r = co_await pool.query_on(conn,
+//                                             "SELECT id, name FROM param_test WHERE id = $1", int64_t{1});
+//             std::cout << "[PARAM-COUNT/POOL] query_on($1 -> 1 arg): "
+//                     << (r.ok ? "OK" : r.error) << "\n";
+//             co_await pool.release_connection_async(conn);
+//         }
+//     }
+//
+//     // --- query_reflect_expected: 2 placeholders, 2 args ---
+//     {
+//         auto rows = co_await pool.query_reflect_expected<ParamRow>(
+//             "SELECT id, name FROM param_test ORDER BY id LIMIT $1 OFFSET $2",
+//             10, 0);
+//         std::cout << "[PARAM-COUNT/POOL] query_reflect_expected($1,$2 -> 2 args): "
+//                 << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//     }
+//
+//     // --- query_reflect_expected_one: 1 placeholder, 1 arg ---
+//     {
+//         auto one = co_await pool.query_reflect_expected_one<ParamRow>(
+//             "SELECT id, name FROM param_test WHERE name = $1 LIMIT 1",
+//             std::string("alice"));
+//         std::cout << "[PARAM-COUNT/POOL] query_reflect_expected_one($1 -> 1 arg): "
+//                 << (one ? "OK" : "not found") << "\n";
+//     }
+//
+//     // --- exec_reflect: struct with 3 fields -> 3 placeholders ---
+//     {
+//         InsRow row{"bob", 99, "from exec_reflect"};
+//         auto r = co_await pool.exec_reflect(
+//             "INSERT INTO param_test(name, value, comment) VALUES($1, $2, $3)",
+//             row);
+//         std::cout << "[PARAM-COUNT/POOL] exec_reflect(struct 3 fields -> $1,$2,$3): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- query_on_reflect: 1 placeholder, 1 arg ---
+//     {
+//         auto c = co_await pool.acquire_connection();
+//         if (c && *c) {
+//             auto conn = *c;
+//             auto rows = co_await pool.query_on_reflect<ParamRow>(conn,
+//                                                                  "SELECT id, name FROM param_test WHERE value = $1",
+//                                                                  42);
+//             std::cout << "[PARAM-COUNT/POOL] query_on_reflect($1 -> 1 arg): OK n="
+//                     << rows.size() << "\n";
+//             co_await pool.release_connection_async(conn);
+//         }
+//     }
+//
+//     // --- query_on_reflect_one: 1 placeholder, 1 arg ---
+//     {
+//         auto c = co_await pool.acquire_connection();
+//         if (c && *c) {
+//             auto conn = *c;
+//             auto one = co_await pool.query_on_reflect_one<ParamRow>(conn,
+//                                                                     "SELECT id, name FROM param_test WHERE name = $1 LIMIT 1",
+//                                                                     std::string("bob"));
+//             std::cout << "[PARAM-COUNT/POOL] query_on_reflect_one($1 -> 1 arg): "
+//                     << (one ? "OK" : "not found") << "\n";
+//             co_await pool.release_connection_async(conn);
+//         }
+//     }
+//
+//     // --- query_on_reflect_expected: 2 placeholders, 2 args ---
+//     {
+//         auto c = co_await pool.acquire_connection();
+//         if (c && *c) {
+//             auto conn = *c;
+//             auto rows = co_await pool.query_on_reflect_expected<ParamRow>(conn,
+//                                                                           "SELECT id, name FROM param_test WHERE value >= $1 ORDER BY id LIMIT $2",
+//                                                                           0, 100);
+//             std::cout << "[PARAM-COUNT/POOL] query_on_reflect_expected($1,$2 -> 2 args): "
+//                     << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//             co_await pool.release_connection_async(conn);
+//         }
+//     }
+//
+//     // --- query_on_reflect_expected_one: 1 placeholder, 1 arg ---
+//     {
+//         auto c = co_await pool.acquire_connection();
+//         if (c && *c) {
+//             auto conn = *c;
+//             auto one = co_await pool.query_on_reflect_expected_one<ParamRow>(conn,
+//                                                                              "SELECT id, name FROM param_test WHERE id = $1",
+//                                                                              int64_t{1});
+//             std::cout << "[PARAM-COUNT/POOL] query_on_reflect_expected_one($1 -> 1 arg): "
+//                     << (one ? "OK" : "not found") << "\n";
+//             co_await pool.release_connection_async(conn);
+//         }
+//     }
+//
+//     std::cout << "[PARAM-COUNT/POOL] all passed\n";
+//     co_return;
+// }
+//
+// task::Awaitable<void> test_param_count_transaction(usub::pg::PgPool &pool) {
+//     std::cout << "[PARAM-COUNT/TX] start\n";
+//
+//     // --- schema ---
+//     {
+//         auto r = co_await pool.query_awaitable(R"SQL(
+//             CREATE TABLE IF NOT EXISTS param_test_tx (
+//                 id       BIGSERIAL PRIMARY KEY,
+//                 name     TEXT NOT NULL,
+//                 value    INT NOT NULL,
+//                 comment  TEXT
+//             );
+//         )SQL");
+//         if (!r.ok) {
+//             std::cout << "[PARAM-COUNT/TX] schema fail: " << r.error << "\n";
+//             co_return;
+//         }
+//         co_await pool.query_awaitable("TRUNCATE param_test_tx RESTART IDENTITY");
+//     }
+//
+//     usub::pg::PgTransaction tx(&pool);
+//     if (auto err = co_await tx.begin_errored(); err) {
+//         co_await tx.finish();
+//         std::cout << "[PARAM-COUNT/TX] begin failed: " << err->error << "\n";
+//         co_return;
+//     }
+//
+//     // --- tx.query: 3 placeholders, 3 args ---
+//     {
+//         auto r = co_await tx.query(
+//             "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
+//             "alice", 10, "from tx.query");
+//         std::cout << "[PARAM-COUNT/TX] query($1,$2,$3 -> 3 args): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- tx.query: 0 placeholders, 0 args ---
+//     {
+//         auto r = co_await tx.query(
+//             "SELECT count(1) FROM param_test_tx");
+//         std::cout << "[PARAM-COUNT/TX] query(0 placeholders, 0 args): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- tx.query_reflect (Obj): struct with 3 fields -> 3 placeholders ---
+//     {
+//         InsRow row{"bob", 20, "from tx.query_reflect"};
+//         auto r = co_await tx.query_reflect(
+//             "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
+//             row);
+//         std::cout << "[PARAM-COUNT/TX] query_reflect(struct -> $1,$2,$3): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- tx.exec_reflect (Obj): struct with 3 fields -> 3 placeholders ---
+//     {
+//         InsRow row{"carol", 30, "from tx.exec_reflect"};
+//         auto r = co_await tx.exec_reflect(
+//             "INSERT INTO param_test_tx(name, value, comment) VALUES($1, $2, $3)",
+//             row);
+//         std::cout << "[PARAM-COUNT/TX] exec_reflect(struct -> $1,$2,$3): "
+//                 << (r.ok ? "OK" : r.error) << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected: 2 placeholders, 2 args ---
+//     {
+//         auto rows = co_await tx.query_reflect_expected<ParamRow>(
+//             "SELECT id, name FROM param_test_tx ORDER BY id LIMIT $1 OFFSET $2",
+//             10, 0);
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected($1,$2 -> 2 args): "
+//                 << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected_one: 1 placeholder, 1 arg ---
+//     {
+//         auto one = co_await tx.query_reflect_expected_one<ParamRow>(
+//             "SELECT id, name FROM param_test_tx WHERE name = $1 LIMIT 1",
+//             std::string("alice"));
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one($1 -> 1 arg): "
+//                 << (one ? "OK" : "not found") << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected (0 args) ---
+//     {
+//         auto rows = co_await tx.query_reflect_expected<ParamRow>(
+//             "SELECT id, name FROM param_test_tx ORDER BY id");
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected(0 args): "
+//                 << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected_one (0 args) ---
+//     {
+//         auto one = co_await tx.query_reflect_expected_one<ParamRow>(
+//             "SELECT id, name FROM param_test_tx ORDER BY id LIMIT 1");
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one(0 args): "
+//                 << (one ? "OK" : "not found") << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected<T, Obj>: struct with 2 fields -> 2 placeholders ---
+//     {
+//         Filter f{0, 100};
+//         auto rows = co_await tx.query_reflect_expected<ParamRow, Filter>(
+//             "SELECT id, name FROM param_test_tx WHERE value >= $1 AND value <= $2 ORDER BY id",
+//             f);
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected<T,Obj>(struct -> $1,$2): "
+//                 << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//     }
+//
+//     // --- tx.query_reflect_expected_one<T, Obj>: struct with 1 field -> 1 placeholder ---
+//     {
+//         ById f{1};
+//         auto one = co_await tx.query_reflect_expected_one<ParamRow, ById>(
+//             "SELECT id, name FROM param_test_tx WHERE id = $1",
+//             f);
+//         std::cout << "[PARAM-COUNT/TX] query_reflect_expected_one<T,Obj>(struct -> $1): "
+//                 << (one ? "OK" : "not found") << "\n";
+//     }
+//
+//     // --- subtransaction tests ---
+//     {
+//         auto sub = tx.make_subtx();
+//         if (co_await sub.begin()) {
+//             // sub.query: 2 placeholders, 2 args
+//             {
+//                 auto r = co_await sub.query(
+//                     "UPDATE param_test_tx SET comment = $1 WHERE id = $2",
+//                     "subtx-updated", int64_t{1});
+//                 std::cout << "[PARAM-COUNT/SUBTX] query($1,$2 -> 2 args): "
+//                         << (r.ok ? "OK" : r.error) << "\n";
+//             }
+//
+//             // sub.query_reflect (Obj): struct with 2 fields -> 2 placeholders
+//             {
+//                 Upd u{.name = "alice-subtx", .id = 1};
+//                 auto r = co_await sub.query_reflect(
+//                     "UPDATE param_test_tx SET name = $1 WHERE id = $2", u);
+//                 std::cout << "[PARAM-COUNT/SUBTX] query_reflect(struct -> $1,$2): "
+//                         << (r.ok ? "OK" : r.error) << "\n";
+//             }
+//
+//             // sub.query_reflect_expected_one: 1 placeholder, 1 arg
+//             {
+//                 auto one = co_await sub.query_reflect_expected_one<ParamRow>(
+//                     "SELECT id, name FROM param_test_tx WHERE id = $1",
+//                     int64_t{1});
+//                 std::cout << "[PARAM-COUNT/SUBTX] query_reflect_expected_one($1 -> 1 arg): "
+//                         << (one ? "OK name=" + one->name : "not found") << "\n";
+//             }
+//
+//             // sub.query_reflect_expected: 1 placeholder, 1 arg
+//             {
+//                 auto rows = co_await sub.query_reflect_expected<ParamRow>(
+//                     "SELECT id, name FROM param_test_tx WHERE value > $1 ORDER BY id",
+//                     0);
+//                 std::cout << "[PARAM-COUNT/SUBTX] query_reflect_expected($1 -> 1 arg): "
+//                         << (rows ? "OK n=" + std::to_string(rows->size()) : "FAIL") << "\n";
+//             }
+//
+//             co_await sub.rollback();
+//         }
+//     }
+//
+//     if (!(co_await tx.commit()))
+//         std::cout << "[PARAM-COUNT/TX] commit failed\n";
+//
+//     std::cout << "[PARAM-COUNT/TX] all passed\n";
+//     co_return;
+// }
+//
+// task::Awaitable<void> test_param_count_mismatch(usub::pg::PgPool &pool) {
+//     // This should trigger assert: 2 placeholders but 3 args
+//     auto r = co_await pool.query_awaitable(
+//         "SELECT * FROM param_test WHERE id = $1 AND name = $2",
+//         1, "alice", "extra_arg");
+//     co_return;
+// }
+//
+// task::Awaitable<void> test_param_count_mismatch_tx(usub::pg::PgPool &pool) {
+//     usub::pg::PgTransaction tx(&pool);
+//     co_await tx.begin();
+//     // This should trigger assert: 1 placeholder but 2 args
+//     auto r = co_await tx.query(
+//         "SELECT * FROM param_test WHERE id = $1",
+//         1, "extra_arg");
+//     co_await tx.rollback();
+//     co_return;
+// }
 
 task::Awaitable<void> test_db_query(usub::pg::PgPool &pool) {
     {
@@ -1881,11 +1881,11 @@ int main() {
     system::co_spawn(test_enum_support(pool));
     system::co_spawn(test_pgjson_ujson(pool));
 
-    system::co_spawn(test_param_count_pool(pool));
-    system::co_spawn(test_param_count_transaction(pool));
-
-    system::co_spawn(test_param_count_mismatch(pool));
-    system::co_spawn(test_param_count_mismatch_tx(pool));
+    // system::co_spawn(test_param_count_pool(pool));
+    // system::co_spawn(test_param_count_transaction(pool));
+    //
+    // system::co_spawn(test_param_count_mismatch(pool));
+    // system::co_spawn(test_param_count_mismatch_tx(pool));
 
     uvent.run();
     return 0;

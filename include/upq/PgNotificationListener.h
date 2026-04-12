@@ -16,6 +16,24 @@
 
 namespace usub::pg
 {
+    namespace detail_listener {
+        inline std::optional<std::string> quote_ident_strict(const std::string& ident) {
+            if (ident.empty()) return std::nullopt;
+            for (char c : ident) {
+                if (c == '\0') return std::nullopt;
+            }
+            std::string out;
+            out.reserve(ident.size() + 2);
+            out.push_back('"');
+            for (char c : ident) {
+                if (c == '"') out.push_back('"');
+                out.push_back(c);
+            }
+            out.push_back('"');
+            return out;
+        }
+    }
+
     template <class HandlerT>
         requires PgNotifyHandler<HandlerT>
     class PgNotificationListener
@@ -42,7 +60,11 @@ namespace usub::pg
             }
 
             {
-                std::string listen_sql = "LISTEN " + this->channel_ + ";";
+                auto q = detail_listener::quote_ident_strict(this->channel_);
+                if (!q) {
+                    co_return;
+                }
+                std::string listen_sql = "LISTEN " + *q + ";";
                 QueryResult qr = co_await this->conn_->exec_simple_query_nonblocking(listen_sql);
                 if (!qr.ok)
                 {
@@ -66,6 +88,8 @@ namespace usub::pg
                     {
                         co_return;
                     }
+                    co_await usub::uvent::system::this_coroutine::sleep_for(
+                        std::chrono::milliseconds(10));
                     continue;
                 }
 

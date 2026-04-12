@@ -17,6 +17,8 @@ add_compile_definitions(DEV_STAGE=${DEV_STAGE})
 
 message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
 
+option(UPQ_HARDENING "Enable compile-time hardening flags" ON)
+
 find_package(OpenSSL REQUIRED)
 find_package(PostgreSQL REQUIRED)
 
@@ -24,21 +26,21 @@ include(FetchContent)
 
 FetchContent_Declare(
         uvent
-        GIT_REPOSITORY https://github.com/Usub-development/uvent.git
+        GIT_REPOSITORY https://github.com/Usub-Foundation/uvent.git
         GIT_TAG main
         OVERRIDE_FIND_PACKAGE
 )
 
 FetchContent_Declare(
         ureflect
-        GIT_REPOSITORY https://github.com/Usub-development/ureflect.git
+        GIT_REPOSITORY https://github.com/Usub-Foundation/ureflect.git
         GIT_TAG main
         OVERRIDE_FIND_PACKAGE
 )
 
 FetchContent_Declare(
         ujson
-        GIT_REPOSITORY https://github.com/Usub-development/ujson.git
+        GIT_REPOSITORY https://github.com/Usub-Foundation/ujson.git
         GIT_TAG main
         OVERRIDE_FIND_PACKAGE
 )
@@ -75,6 +77,24 @@ if (TARGET PostgreSQL::pq)
         target_link_libraries(upq PUBLIC PostgreSQL::pq)
 endif()
 
+if (UPQ_HARDENING)
+        if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                target_compile_options(upq PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        -Wformat=2 -Wformat-security
+                        -Wcast-qual -Wcast-align
+                        -Wnull-dereference
+                        -fstack-protector-strong
+                        $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
+                )
+                target_link_options(upq PRIVATE
+                        -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+                )
+        elseif (MSVC)
+                target_compile_options(upq PRIVATE /W4 /guard:cf /sdl)
+        endif()
+endif()
+
 set_target_properties(upq PROPERTIES
         EXPORT_NAME upq
         VERSION ${PROJECT_VERSION}
@@ -101,14 +121,14 @@ if (UPQ_BUILD_EXAMPLES)
 
         FetchContent_Declare(
                 ulog
-                GIT_REPOSITORY https://github.com/Usub-development/ulog.git
+                GIT_REPOSITORY https://github.com/Usub-Foundation/ulog.git
                 GIT_TAG main
                 OVERRIDE_FIND_PACKAGE
         )
         FetchContent_Declare(
                 unet
-                GIT_REPOSITORY https://github.com/Usub-development/unet.git
-                GIT_TAG main
+                GIT_REPOSITORY https://github.com/Usub-Foundation/unet.git
+                GIT_TAG v0.2.1
                 OVERRIDE_FIND_PACKAGE
         )
         FetchContent_MakeAvailable(unet ulog)

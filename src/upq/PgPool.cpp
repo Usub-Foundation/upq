@@ -246,6 +246,17 @@ namespace usub::pg {
     void PgPool::mark_dead(std::shared_ptr<PgConnectionLibpq> const &conn) {
         if (!conn)
             return;
+
+        bool expected = false;
+        if (!conn->dead_accounted_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+#if UPQ_POOL_DEBUG
+            UPQ_POOL_DBG("mark_dead: conn=%p already accounted, skipping", conn.get());
+#endif
+            conn->close();
+            return;
+        }
+
 #if UPQ_POOL_DEBUG
         UPQ_POOL_DBG("mark_dead: conn=%p", conn.get());
 #endif

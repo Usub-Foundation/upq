@@ -34,9 +34,11 @@ namespace usub::pg::utils {
         if (host.find('%') != std::string_view::npos)
             return false;
 
+        std::string host_cstr(host);
+
         unsigned char buf[sizeof(in6_addr)]{};
-        return ::inet_pton(AF_INET, host.data(), buf) == 1 ||
-               ::inet_pton(AF_INET6, host.data(), buf) == 1;
+        return ::inet_pton(AF_INET, host_cstr.c_str(), buf) == 1 ||
+               ::inet_pton(AF_INET6, host_cstr.c_str(), buf) == 1;
     }
 
     static inline std::expected<std::string, ConninfoError>

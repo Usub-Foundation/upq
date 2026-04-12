@@ -2,6 +2,7 @@
 #define PGCONNECTIONLIBPQ_H
 
 #include <bit>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -845,6 +847,11 @@ namespace usub::pg {
         > sock_;
 
         uint64_t cursor_seq_{0};
+
+        mutable std::mutex close_mtx_;
+
+    public:
+        std::atomic<bool> dead_accounted_{false};
     };
 
     template<typename... Args>

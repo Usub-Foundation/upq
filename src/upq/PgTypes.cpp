@@ -60,10 +60,14 @@ namespace usub::pg
             uint8_t code = payload[i++];
             if (code == 0) break;
 
-            const char* start = (const char*)&payload[i];
-            size_t len = std::strlen(start);
+            size_t end = i;
+            while (end < payload.size() && payload[end] != 0) ++end;
+            if (end >= payload.size()) {
+                break;
+            }
+            const size_t len = end - i;
 
-            std::string val(start, len);
+            std::string val(reinterpret_cast<const char*>(&payload[i]), len);
 
             switch (code)
             {
@@ -80,7 +84,7 @@ namespace usub::pg
             default: break;
             }
 
-            i += len + 1;
+            i = end + 1;
         }
         return f;
     }
@@ -319,14 +323,12 @@ namespace usub::pg
         const uint8_t salt[4]
     )
     {
-        // step1 = md5(password + user)
         std::string step1_src = password + user;
         std::string step1_hex = md5_hex(
             reinterpret_cast<const uint8_t*>(step1_src.data()),
             step1_src.size()
         );
 
-        // step2 = md5(step1_hex + salt)
         std::string step2_src;
         step2_src.reserve(step1_hex.size() + 4);
         step2_src.append(step1_hex);

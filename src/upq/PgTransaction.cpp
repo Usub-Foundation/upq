@@ -1,5 +1,6 @@
 #include "upq/PgTransaction.h"
 #include <atomic>
+#include <cstdio>
 
 namespace usub::pg
 {
@@ -49,6 +50,13 @@ namespace usub::pg
     {
         if (this->conn_)
         {
+            if (this->active_ && !this->committed_ && !this->rolled_back_)
+            {
+                std::fprintf(stderr,
+                    "[UPQ/tx] WARNING: PgTransaction destroyed while active; "
+                    "connection will be closed to force implicit rollback. "
+                    "Always call commit()/rollback()/finish() explicitly.\n");
+            }
             this->pool_->mark_dead(this->conn_);
             this->conn_.reset();
         }

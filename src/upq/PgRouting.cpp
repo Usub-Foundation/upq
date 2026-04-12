@@ -3,6 +3,7 @@
 #include "uvent/Uvent.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 using namespace std::chrono;
 
@@ -29,7 +30,15 @@ namespace usub::pg {
                     ep.max_pool ? ep.max_pool : pool_cap_for(ep.role, this->cfg_.limits),
                     this->cfg_.connect_retries, this->cfg_.ssl_config, this->cfg_.keepalive_config
                 );
+            } catch (const std::exception &e) {
+                std::fprintf(stderr,
+                    "[UPQ/routing] WARNING: failed to construct pool for node '%s': %s\n",
+                    ep.name.c_str(), e.what());
             } catch (...) {
+                std::fprintf(stderr,
+                    "[UPQ/routing] WARNING: failed to construct pool for node '%s': "
+                    "unknown exception\n",
+                    ep.name.c_str());
             }
             this->nodes_.push_back(Node{ep, std::move(pool), {}});
         }
@@ -60,7 +69,16 @@ namespace usub::pg {
                                               this->cfg_.connect_retries, this->cfg_.ssl_config,
                                               this->cfg_.keepalive_config);
             return true;
+        } catch (const std::exception &e) {
+            std::fprintf(stderr,
+                "[UPQ/routing] WARNING: ensure_pool failed for node '%s': %s\n",
+                n.ep.name.c_str(), e.what());
+            n.pool.reset();
+            return false;
         } catch (...) {
+            std::fprintf(stderr,
+                "[UPQ/routing] WARNING: ensure_pool failed for node '%s': unknown exception\n",
+                n.ep.name.c_str());
             n.pool.reset();
             return false;
         }

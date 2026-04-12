@@ -841,6 +841,8 @@ namespace usub::pg {
         co_return out;
     }
 
+    inline constexpr uint32_t kMaxPgFramePayload = 512u * 1024u * 1024u; // 512 MiB
+
     template <class Socket>
     uvent::task::Awaitable<PgWireResult<PgFrame>> read_frame(Socket &sock) {
         PgWireResult<PgFrame> out;
@@ -867,6 +869,12 @@ namespace usub::pg {
         }
 
         uint32_t payload_len = len - 4;
+
+        if (payload_len > kMaxPgFramePayload) {
+            out.err.code = PgErrorCode::ProtocolCorrupt;
+            out.err.message = "frame length exceeds kMaxPgFramePayload";
+            co_return out;
+        }
 
         std::vector<uint8_t> payload;
         {
@@ -924,6 +932,7 @@ namespace usub::pg {
 
     std::string md5_hex(const uint8_t *data, size_t len);
 
+    [[deprecated("MD5 auth is broken; use SCRAM-SHA-256 via libpq")]]
     std::vector<uint8_t> build_md5_password_message(const std::string &user,
                                                     const std::string &password,
                                                     const uint8_t salt[4]);

@@ -4,6 +4,8 @@ services:
     container_name: pg_local
     environment:
       POSTGRES_USER: postgres
+      # WARNING: example-only password. NEVER use this in production.
+      # Replace with a value from a .env file or a secrets manager.
       POSTGRES_PASSWORD: password
       POSTGRES_DB: postgres
     ports:

@@ -504,7 +504,9 @@ namespace usub::pg {
         inline std::string port() { return this->port_; }
         inline std::string user() { return this->user_; }
         inline std::string db() { return this->db_; }
-        inline std::string password() { return this->password_; }
+
+        [[deprecated("password() leaks credentials; use make_conninfo internally")]]
+        inline std::string password() { return std::string("***"); }
 
         void mark_dead(std::shared_ptr<PgConnectionLibpq> const &conn);
 

@@ -38,17 +38,6 @@
 #endif
 #endif
 
-// flags:
-//
-/// std::vector<uint32_t> QueryResult::column_oids;
-/// std::vector<uint32_t> Row::column_oids;
-/// std::string oid_to_typename(uint32_t)
-///
-//// #define UPQ_RESULT_HAS_COLUMN_OIDS
-//// #define UPQ_ROW_HAS_COLUMN_OIDS
-//// #define UPQ_HAVE_OID_TO_TYPENAME
-//// #define UPQ_ENABLE_PARAM_ENCODER
-
 namespace usub::pg {
     namespace detail {
         inline std::string join_csv(const std::vector<std::string> &v) {
@@ -152,7 +141,7 @@ namespace usub::pg {
             for (; i + 1 < s.size(); ++i) {
                 char c = s[i];
                 if (inq) {
-                    if (c == '"' && i + 1 < s.size() && s[i + 1] == '"') {
+                    if (c == '\\' && i + 1 < s.size()) {
                         ++i;
                         continue;
                     }
@@ -187,11 +176,12 @@ namespace usub::pg {
                 out.reserve(sv.size());
                 for (size_t i = 1; i + 1 < sv.size(); ++i) {
                     char c = sv[i];
-                    if (c == '"' && i + 1 < sv.size() && sv[i + 1] == '"') {
-                        out.push_back('"');
+                    if (c == '\\' && i + 1 < sv.size() - 1) {
+                        out.push_back(sv[i + 1]);
                         ++i;
-                    } else
+                    } else {
                         out.push_back(c);
+                    }
                 }
                 return true;
             }
