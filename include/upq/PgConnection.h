@@ -825,11 +825,32 @@ namespace usub::pg {
 
         std::string make_cursor_name();
 
+        static bool is_safe_cursor_ident(const std::string &s);
+
         usub::uvent::task::Awaitable<QueryResult>
         cursor_declare(const std::string &cursor_name, const std::string &sql);
 
         usub::uvent::task::Awaitable<QueryResult>
         cursor_declare_in_tx(const std::string &cursor_name, const std::string &sql);
+
+        template<typename... Args>
+        usub::uvent::task::Awaitable<QueryResult>
+        cursor_declare_in_tx_params(const std::string &cursor_name,
+                                    const std::string &sql,
+                                    Args &&... args) {
+            if (!is_safe_cursor_ident(cursor_name)) {
+                QueryResult err{};
+                err.ok = false;
+                err.code = PgErrorCode::ProtocolCorrupt;
+                err.error = "invalid cursor name";
+                err.rows_valid = false;
+                co_return err;
+            }
+            const std::string stmt =
+                "DECLARE " + cursor_name + " NO SCROLL CURSOR FOR " + sql;
+            co_return co_await exec_param_query_nonblocking(
+                stmt, std::forward<Args>(args)...);
+        }
 
         usub::uvent::task::Awaitable<PgCursorChunk>
         cursor_fetch_chunk(const std::string &cursor_name, uint32_t count);

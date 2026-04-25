@@ -523,7 +523,7 @@ namespace usub::pg {
         }
     }
 
-    static bool is_safe_cursor_ident(const std::string &s) {
+    bool PgConnectionLibpq::is_safe_cursor_ident(const std::string &s) {
         if (s.empty() || s.size() > 63) return false;
         auto c0 = static_cast<unsigned char>(s[0]);
         if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))

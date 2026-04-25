@@ -330,6 +330,74 @@ task::Awaitable<void> demo_pipeline(PgPool& pool) {
     }
 }
 
+task::Awaitable<void> demo_stream_with_params(PgPool& pool) {
+    const int64_t lower = 100000;
+    const int64_t upper = 100100;
+
+    auto sres = co_await pool.stream_reflect<BigRow>(
+        "SELECT id, name, tag FROM big_table "
+        "WHERE id BETWEEN $1 AND $2 ORDER BY id",
+        1000, lower, upper);
+
+    if (!sres) {
+        std::cerr << "[params] stream open failed: "
+                  << sres.error().error << "\n";
+        co_return;
+    }
+
+    uint64_t got = 0;
+    int64_t sum_id = 0;
+    while (auto row = co_await sres->next()) {
+        ++got;
+        sum_id += row->id;
+    }
+    co_await sres->close();
+
+    std::cout << "[params] rows in [" << lower << "," << upper << "]: "
+              << got << " sum_id=" << sum_id << "\n";
+
+    auto sres2 = co_await pool.stream(
+        "SELECT id FROM big_table WHERE id % $1 = $2 LIMIT $3",
+        500, int64_t{7}, int64_t{0}, int64_t{20});
+
+    if (!sres2) {
+        std::cerr << "[params] second stream open failed: "
+                  << sres2.error().error << "\n";
+        co_return;
+    }
+
+    uint64_t mult7 = 0;
+    while (auto row = co_await sres2->next()) ++mult7;
+    co_await sres2->close();
+
+    std::cout << "[params] multiples-of-7 sample: " << mult7 << "\n";
+
+    namespace ps = usub::pg::stream;
+
+    auto s3 = co_await pool.stream_reflect<BigRow>(
+        "SELECT id, name, tag FROM big_table "
+        "WHERE id > $1 AND tag IS NOT NULL ORDER BY id",
+        2000, int64_t{50000});
+
+    if (!s3) {
+        std::cerr << "[params] pipeline open failed: "
+                  << s3.error().error << "\n";
+        co_return;
+    }
+
+    int64_t pipe_sum = co_await(
+        std::move(*s3)
+        | ps::filter([](const BigRow& r) { return r.id % 2 == 0; })
+        | ps::take(1000)
+        | ps::reduce(int64_t{0}, [](int64_t acc, BigRow r) {
+            return acc + r.id;
+        })
+    );
+
+    std::cout << "[params] pipeline sum(even, id>50000, tagged, first 1000): "
+              << pipe_sum << "\n";
+}
+
 task::Awaitable<void> run_all(PgPool& pool, usub::Uvent& uvent) {
     co_await seed(pool);
     co_await demo_row_stream(pool);
@@ -340,6 +408,7 @@ task::Awaitable<void> run_all(PgPool& pool, usub::Uvent& uvent) {
     co_await demo_copy_from_buffer(pool);
     co_await demo_snapshot_workers(pool);
     co_await demo_pipeline(pool);
+    co_await demo_stream_with_params(pool);
     pool.close_all();
     uvent.stop();
     co_return;

@@ -510,10 +510,67 @@ namespace usub::pg {
         usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
         stream(std::string sql, uint32_t batch_size = 1000);
 
+        template <typename... Args>
+            requires (sizeof...(Args) > 0)
+        usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
+        stream(std::string sql, uint32_t batch_size, Args &&... args) {
+            auto c = co_await acquire_connection();
+            if (!c) co_return std::unexpected(c.error());
+
+            auto conn = *c;
+            const std::string cursor_name = conn->make_cursor_name();
+
+            {
+                QueryResult r = co_await conn->exec_simple_query_nonblocking("BEGIN;");
+                if (!r.ok) {
+                    PgOpError err{r.code, r.error, r.err_detail};
+                    if (is_fatal_connection_error(r)) mark_dead(conn);
+                    else co_await release_connection_async(conn);
+                    co_return std::unexpected(std::move(err));
+                }
+            }
+
+            {
+                QueryResult r = co_await conn->cursor_declare_in_tx_params(
+                    cursor_name, sql, std::forward<Args>(args)...);
+                if (!r.ok) {
+                    PgOpError err{r.code, r.error, r.err_detail};
+                    if (is_fatal_connection_error(r)) {
+                        mark_dead(conn);
+                    } else {
+                        co_await conn->exec_simple_query_nonblocking("ROLLBACK;");
+                        co_await release_connection_async(conn);
+                    }
+                    co_return std::unexpected(std::move(err));
+                }
+            }
+
+            PgRowStream s;
+            s.pool_ = this;
+            s.conn_ = std::move(conn);
+            s.cursor_name_ = cursor_name;
+            s.batch_size_ = batch_size ? batch_size : 1;
+            s.owns_tx_ = true;
+            s.active_ = true;
+            s.exhausted_ = false;
+            co_return std::expected<PgRowStream, PgOpError>{std::in_place, std::move(s)};
+        }
+
         template <class T>
         usub::uvent::task::Awaitable<std::expected<PgTypedRowStream<T>, PgOpError> >
         stream_reflect(std::string sql, uint32_t batch_size = 1000) {
             auto s = co_await stream(std::move(sql), batch_size);
+            if (!s) co_return std::unexpected(s.error());
+            co_return std::expected<PgTypedRowStream<T>, PgOpError>{
+                std::in_place, PgTypedRowStream<T>{std::move(*s)}};
+        }
+
+        template <class T, typename... Args>
+            requires (sizeof...(Args) > 0)
+        usub::uvent::task::Awaitable<std::expected<PgTypedRowStream<T>, PgOpError> >
+        stream_reflect(std::string sql, uint32_t batch_size, Args &&... args) {
+            auto s = co_await stream(std::move(sql), batch_size,
+                                     std::forward<Args>(args)...);
             if (!s) co_return std::unexpected(s.error());
             co_return std::expected<PgTypedRowStream<T>, PgOpError>{
                 std::in_place, PgTypedRowStream<T>{std::move(*s)}};

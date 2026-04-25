@@ -90,6 +90,61 @@ co_await tx.commit();
 The stream returned from a transaction does **not** commit on `close()` —
 lifetime is bound to `tx`.
 
+### Bind parameters (`$1, $2, …`)
+
+`stream` and `stream_reflect` accept variadic arguments after `batch_size`,
+forwarded to the cursor's underlying `SELECT` via libpq's extended protocol
+(`PQsendQueryParams`). Postgres binds them inside the `DECLARE … CURSOR FOR …`
+in a single round trip — no manual `PREPARE`, no string interpolation.
+
+```cpp
+const int64_t lower = 100000;
+const int64_t upper = 100100;
+
+auto sres = co_await pool.stream_reflect<BigRow>(
+    "SELECT id, name, tag FROM big_table "
+    "WHERE id BETWEEN $1 AND $2 ORDER BY id",
+    1000, lower, upper);
+```
+
+The first non-SQL argument is `batch_size` (required, no default in this
+overload — pass `1000` or whatever you'd otherwise default to). Everything
+after it is passed positionally as `$1`, `$2`, …. Argument count is checked
+at runtime via `assert` against `count_pg_params(sql)` — same path the
+existing `query_awaitable(sql, args...)` uses.
+
+Mixing with the pipeline works the same as without parameters — the
+returned stream is still a normal `PgRowStream` / `PgTypedRowStream<T>`:
+
+```cpp
+namespace ps = usub::pg::stream;
+
+auto s = co_await pool.stream_reflect<BigRow>(
+    "SELECT id, name, tag FROM big_table "
+    "WHERE id > $1 AND tag IS NOT NULL ORDER BY id",
+    2000, int64_t{50000});
+
+int64_t sum = co_await(
+    std::move(*s)
+    | ps::filter([](const BigRow& r) { return r.id % 2 == 0; })
+    | ps::take(1000)
+    | ps::reduce(int64_t{0}, [](int64_t acc, BigRow r) { return acc + r.id; })
+);
+```
+
+The same templated overloads are also on `PgTransaction::stream` and
+`PgTransaction::stream_reflect`.
+
+#### What about `copy_to` / `copy_from`?
+
+`COPY tablename TO STDOUT` does not accept parameters in its grammar, and
+`COPY (SELECT ... WHERE x = $1) TO STDOUT` cannot be combined cleanly with
+libpq's extended-protocol path because libpq does not switch into COPY mode
+after `PQsendQueryParams`. If you need a parameterised export, use
+`pool.stream(sql, batch_size, args…)` instead — the row-by-row path is the
+intended substitute. `COPY FROM STDIN` has no place for parameters at all,
+so `copy_from` / `copy_from_buffer` only take SQL.
+
 ---
 
 ## 2. `copy_to` — streaming COPY OUT
@@ -452,18 +507,26 @@ what `pg_dump` uses for a reason.
 task::Awaitable<expected<PgRowStream, PgOpError>>
     pool.stream(sql, batch_size = 1000);
 
+template<typename... Args>
+task::Awaitable<expected<PgRowStream, PgOpError>>
+    pool.stream(sql, batch_size, args...);   // $1, $2, ... bound via PQsendQueryParams
+
 template<class T>
 task::Awaitable<expected<PgTypedRowStream<T>, PgOpError>>
     pool.stream_reflect<T>(sql, batch_size = 1000);
 
-// COPY OUT
+template<class T, typename... Args>
+task::Awaitable<expected<PgTypedRowStream<T>, PgOpError>>
+    pool.stream_reflect<T>(sql, batch_size, args...);
+
+// COPY OUT (no parameter binding — see section 1)
 template<class Sink>   // (string_view) -> Awaitable<bool>
 task::Awaitable<PgCopyResult> pool.copy_to(sql, sink);
 
 template<class LineSink>   // (string_view line) -> Awaitable<bool>
 task::Awaitable<PgCopyResult> pool.copy_to_lines(sql, line_sink);
 
-// COPY IN
+// COPY IN (no parameter binding — grammar does not allow it)
 template<class Source>   // () -> Awaitable<string_view>  (empty = EOF)
 task::Awaitable<PgCopyResult> pool.copy_from(sql, source);
 
