@@ -796,21 +796,49 @@ namespace usub::pg {
         usub::uvent::task::Awaitable<PgCopyResult> copy_in_send_chunk(const void *data, size_t len);
 
         usub::uvent::task::Awaitable<PgCopyResult> copy_in_finish();
+        usub::uvent::task::Awaitable<PgCopyResult> copy_in_finish(const char *error_msg);
 
         usub::uvent::task::Awaitable<PgCopyResult> copy_out_start(const std::string &sql);
 
         usub::uvent::task::Awaitable<PgWireResult<std::vector<uint8_t> > > copy_out_read_chunk();
+
+        template <class Sink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to(const std::string &sql, Sink &&sink);
+
+        template <class LineSink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to_lines(const std::string &sql, LineSink &&line_sink);
+
+        template <class Source>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from(const std::string &sql, Source &&source);
+
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from_buffer(const std::string &sql, const void *data, size_t len);
+
+        usub::uvent::task::Awaitable<std::expected<std::string, PgOpError> >
+        export_snapshot();
+
+        usub::uvent::task::Awaitable<std::optional<PgOpError> >
+        set_snapshot(const std::string &snapshot_id);
 
         std::string make_cursor_name();
 
         usub::uvent::task::Awaitable<QueryResult>
         cursor_declare(const std::string &cursor_name, const std::string &sql);
 
+        usub::uvent::task::Awaitable<QueryResult>
+        cursor_declare_in_tx(const std::string &cursor_name, const std::string &sql);
+
         usub::uvent::task::Awaitable<PgCursorChunk>
         cursor_fetch_chunk(const std::string &cursor_name, uint32_t count);
 
         usub::uvent::task::Awaitable<QueryResult>
         cursor_close(const std::string &cursor_name);
+
+        usub::uvent::task::Awaitable<QueryResult>
+        cursor_close_in_tx(const std::string &cursor_name);
 
         PGconn *raw_conn() noexcept;
 
@@ -997,6 +1025,111 @@ namespace usub::pg {
 
             co_await wait_readable();
         }
+    }
+
+    template <class Sink>
+    usub::uvent::task::Awaitable<PgCopyResult>
+    PgConnectionLibpq::copy_to(const std::string &sql, Sink &&sink) {
+        PgCopyResult start = co_await copy_out_start(sql);
+        if (!start.ok) co_return start;
+
+        PgCopyResult final_result{};
+        final_result.ok = true;
+        final_result.code = PgErrorCode::OK;
+
+        bool user_aborted = false;
+
+        for (;;) {
+            auto chunk = co_await copy_out_read_chunk();
+            if (!chunk.ok) {
+                final_result.ok = false;
+                final_result.code = chunk.err.code;
+                final_result.error = chunk.err.message;
+                co_return final_result;
+            }
+            if (chunk.value.empty()) {
+                break;
+            }
+            if (user_aborted) {
+                continue;
+            }
+            const std::string_view sv(
+                reinterpret_cast<const char *>(chunk.value.data()),
+                chunk.value.size());
+            bool keep_going = co_await sink(sv);
+            if (!keep_going) {
+                user_aborted = true;
+            }
+        }
+
+        if (user_aborted) {
+            final_result.ok = false;
+            final_result.code = PgErrorCode::AwaitCanceled;
+            final_result.error = "COPY TO aborted by sink";
+        }
+        co_return final_result;
+    }
+
+    template <class LineSink>
+    usub::uvent::task::Awaitable<PgCopyResult>
+    PgConnectionLibpq::copy_to_lines(const std::string &sql,
+                                     LineSink &&line_sink) {
+        std::string carry;
+
+        auto chunk_sink =
+            [&](std::string_view sv) -> usub::uvent::task::Awaitable<bool> {
+                size_t pos = 0;
+                while (pos < sv.size()) {
+                    const auto nl = sv.find('\n', pos);
+                    if (nl == std::string_view::npos) {
+                        carry.append(sv.data() + pos, sv.size() - pos);
+                        break;
+                    }
+                    std::string_view line;
+                    if (!carry.empty()) {
+                        carry.append(sv.data() + pos, nl - pos);
+                        line = std::string_view(carry);
+                    } else {
+                        line = std::string_view(sv.data() + pos, nl - pos);
+                    }
+                    bool keep = co_await line_sink(line);
+                    carry.clear();
+                    if (!keep) co_return false;
+                    pos = nl + 1;
+                }
+                co_return true;
+            };
+
+        PgCopyResult r = co_await copy_to(sql, chunk_sink);
+
+        if (r.ok && !carry.empty()) {
+            bool keep = co_await line_sink(std::string_view(carry));
+            if (!keep) {
+                r.ok = false;
+                r.code = PgErrorCode::AwaitCanceled;
+                r.error = "COPY TO aborted by sink";
+            }
+            carry.clear();
+        }
+        co_return r;
+    }
+
+    template <class Source>
+    usub::uvent::task::Awaitable<PgCopyResult>
+    PgConnectionLibpq::copy_from(const std::string &sql, Source &&source) {
+        PgCopyResult start = co_await copy_in_start(sql);
+        if (!start.ok) co_return start;
+
+        for (;;) {
+            std::string_view sv = co_await source();
+            if (sv.empty()) break;
+            PgCopyResult send = co_await copy_in_send_chunk(sv.data(), sv.size());
+            if (!send.ok) {
+                co_await copy_in_finish("aborted: send chunk failed");
+                co_return send;
+            }
+        }
+        co_return co_await copy_in_finish();
     }
 } // namespace usub::pg
 

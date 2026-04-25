@@ -1158,11 +1158,11 @@ usub::uvent::task::Awaitable<void> spawn_listener_multiplexer(usub::pg::PgPool &
 
     usub::pg::PgNotificationMultiplexer mux(
         *c,
-        pool.host(),
-        pool.port(),
-        pool.user(),
-        pool.db(),
-        pool.password(),
+        "localhost",
+        "12432",
+        "postgres",
+        "postgres",
+        "password",
         {512}
     );
 
@@ -1182,168 +1182,6 @@ usub::uvent::task::Awaitable<void> spawn_listener_multiplexer(usub::pg::PgPool &
     }
 
     co_await mux.run();
-    co_return;
-}
-
-task::Awaitable<void> massive_ops_example(usub::pg::PgPool &pool) {
-    {
-        auto res_schema = co_await pool.query_awaitable(
-            "CREATE TABLE IF NOT EXISTS public.bigdata("
-            "id BIGSERIAL PRIMARY KEY,"
-            "payload TEXT"
-            ");"
-        );
-
-        if (!res_schema.ok) {
-            std::cout << "[ERROR] bigdata schema init failed: " << res_schema.error << std::endl;
-            co_return;
-        }
-    }
-    {
-        auto c = co_await pool.acquire_connection();
-        if (!c || !*c || !(*c)->connected()) {
-            std::cout << "[ERROR] no conn for COPY IN" << std::endl;
-            co_return;
-        }
-        auto conn = *c;
-        {
-            usub::pg::PgCopyResult st = co_await conn->copy_in_start(
-                "COPY public.bigdata(payload) FROM STDIN"
-            );
-
-            if (!st.ok) {
-                std::cout << "[ERROR] COPY IN start failed: " << st.error << std::endl;
-                co_await pool.release_connection_async(conn);
-                co_return;
-            }
-        }
-        {
-            for (int i = 0; i < 5; i++) {
-                std::string line = "payload line " + std::to_string(i) + "\n";
-
-                usub::pg::PgCopyResult chunk_res = co_await conn->copy_in_send_chunk(
-                    line.data(),
-                    line.size()
-                );
-
-                if (!chunk_res.ok) {
-                    std::cout << "[ERROR] COPY IN chunk failed: " << chunk_res.error << std::endl;
-                    co_await pool.release_connection_async(conn);
-                    co_return;
-                }
-            }
-        }
-        {
-            usub::pg::PgCopyResult fin = co_await conn->copy_in_finish();
-            if (!fin.ok) {
-                std::cout << "[ERROR] COPY IN finish failed: " << fin.error << std::endl;
-                co_await pool.release_connection_async(conn);
-                co_return;
-            }
-
-            std::cout << "[INFO] COPY IN done, rows_affected=" << fin.rows_affected << std::endl;
-        }
-
-        co_await pool.release_connection_async(conn);
-    }
-    {
-        auto c = co_await pool.acquire_connection();
-        if (!c || !*c || !(*c)->connected()) {
-            std::cout << "[ERROR] no conn for COPY OUT" << std::endl;
-            co_return;
-        }
-        auto conn = *c;
-        {
-            usub::pg::PgCopyResult st = co_await conn->copy_out_start(
-                "COPY (SELECT id, payload FROM public.bigdata ORDER BY id LIMIT 10) TO STDOUT"
-            );
-
-            if (!st.ok) {
-                std::cout << "[ERROR] COPY OUT start failed: " << st.error << std::endl;
-                co_await pool.release_connection_async(conn);
-                co_return;
-            }
-        }
-
-        while (true) {
-            auto chunk = co_await conn->copy_out_read_chunk();
-            if (!chunk.ok) {
-                std::cout << "[ERROR] COPY OUT chunk read failed: " << chunk.err.message << std::endl;
-                break;
-            }
-
-            if (chunk.value.empty()) {
-                std::cout << "[INFO] COPY OUT finished" << std::endl;
-                break;
-            }
-
-            std::string s(chunk.value.begin(), chunk.value.end());
-            std::cout << "[COPY-OUT-CHUNK] " << s;
-        }
-
-        co_await pool.release_connection_async(conn);
-    }
-    {
-        auto c = co_await pool.acquire_connection();
-        if (!c || !*c || !(*c)->connected()) {
-            std::cout << "[ERROR] no conn for cursor" << std::endl;
-            co_return;
-        }
-        auto conn = *c;
-
-        std::string cursor_name = conn->make_cursor_name();
-        {
-            auto decl_res = co_await conn->cursor_declare(
-                cursor_name,
-                "SELECT id, payload FROM public.bigdata ORDER BY id"
-            );
-
-            if (!decl_res.ok) {
-                std::cout << "[ERROR] cursor DECLARE failed: " << decl_res.error << std::endl;
-                co_await pool.release_connection_async(conn);
-                co_return;
-            }
-        }
-
-        while (true) {
-            usub::pg::PgCursorChunk ck = co_await conn->cursor_fetch_chunk(cursor_name, 3);
-
-            if (!ck.ok) {
-                std::cout << "[ERROR] cursor FETCH failed: " << ck.error << std::endl;
-                break;
-            }
-
-            if (ck.rows.empty()) {
-                std::cout << "[INFO] cursor FETCH done" << std::endl;
-                break;
-            }
-
-            for (auto &row: ck.rows) {
-                if (row.cols.size() >= 2) {
-                    std::cout << "[CURSOR] id=" << row.cols[0]
-                            << " payload=" << row.cols[1] << std::endl;
-                } else {
-                    std::cout << "[CURSOR] incomplete row" << std::endl;
-                }
-            }
-
-            if (ck.done) {
-                std::cout << "[INFO] cursor reported done" << std::endl;
-                break;
-            }
-        }
-        {
-            auto cls_res = co_await conn->cursor_close(cursor_name);
-            if (!cls_res.ok) {
-                std::cout << "[WARN] cursor CLOSE failed: " << cls_res.error << std::endl;
-            } else {
-                std::cout << "[INFO] cursor closed" << std::endl;
-            }
-        }
-
-        pool.release_connection(conn);
-    }
-
     co_return;
 }
 
@@ -1871,7 +1709,6 @@ int main() {
 
     system::co_spawn(spawn_listener_multiplexer(pool));
     system::co_spawn(spawn_listener(pool));
-    system::co_spawn(massive_ops_example(pool));
     system::co_spawn(test_array_inserts(pool));
     system::co_spawn(test_reflect_query(pool));
     system::co_spawn(tx_reflect_example(pool));

@@ -19,8 +19,12 @@ with [ureflect](https://github.com/Usub-development/ureflect).
 * Safe transactional RAII wrapper (`PgTransaction`)
 * Parameter binding with `$1, $2, …`
 * Zero-copy non-blocking I/O pipeline
-* **NEW:** Reflection-aware queries (`query_reflect`, `exec_reflect`, `query_reflect_one`)  
+* **Reflection-aware queries** (`query_reflect`, `exec_reflect`, `query_reflect_one`)  
   → automatic struct ↔ SQL row mapping via `ureflect`
+* Large-export API — cursor-backed `PgRowStream`,
+  streaming `COPY TO` / `COPY FROM` with async sinks/sources,
+  `pg_export_snapshot` support for parallel consistent dumps
+  ([see docs](docs/large-exports.md))
 
 ---
 

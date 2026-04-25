@@ -16,6 +16,7 @@
 #include "PgConnection.h"
 #include "PgTypes.h"
 #include "PgReflect.h"
+#include "PgRowStream.h"
 #include "utils/ConnInfo.h"
 #include "uvent/utils/datastructures/queue/ConcurrentQueues.h"
 
@@ -23,7 +24,6 @@
 #define UPQ_POOL_DBG(fmt, ...) \
     do { std::fprintf(stderr, "[UPQ/pool] " fmt "\n", ##__VA_ARGS__); } while (0)
 #endif
-
 
 namespace usub::pg {
     struct HealthStats {
@@ -64,6 +64,8 @@ namespace usub::pg {
                TCPKeepaliveConfig keepalive_config = {});
 
         ~PgPool();
+
+        void close_all();
 
         usub::uvent::task::Awaitable<std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError> >
         acquire_connection();
@@ -504,6 +506,93 @@ namespace usub::pg {
         inline std::string port() { return this->port_; }
         inline std::string user() { return this->user_; }
         inline std::string db() { return this->db_; }
+
+        usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
+        stream(std::string sql, uint32_t batch_size = 1000);
+
+        template <class T>
+        usub::uvent::task::Awaitable<std::expected<PgTypedRowStream<T>, PgOpError> >
+        stream_reflect(std::string sql, uint32_t batch_size = 1000) {
+            auto s = co_await stream(std::move(sql), batch_size);
+            if (!s) co_return std::unexpected(s.error());
+            co_return std::expected<PgTypedRowStream<T>, PgOpError>{
+                std::in_place, PgTypedRowStream<T>{std::move(*s)}};
+        }
+
+        template <class Sink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to(std::string sql, Sink sink) {
+            auto c = co_await acquire_connection();
+            if (!c) {
+                const auto &e = c.error();
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = e.code;
+                bad.error = e.error;
+                bad.err_detail = e.err_detail;
+                co_return bad;
+            }
+            auto conn = *c;
+            PgCopyResult r = co_await conn->copy_to(sql, sink);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                mark_dead(conn);
+            } else {
+                co_await release_connection_async(conn);
+            }
+            co_return r;
+        }
+
+        template <class LineSink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to_lines(std::string sql, LineSink sink) {
+            auto c = co_await acquire_connection();
+            if (!c) {
+                const auto &e = c.error();
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = e.code;
+                bad.error = e.error;
+                bad.err_detail = e.err_detail;
+                co_return bad;
+            }
+            auto conn = *c;
+            PgCopyResult r = co_await conn->copy_to_lines(sql, sink);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                mark_dead(conn);
+            } else {
+                co_await release_connection_async(conn);
+            }
+            co_return r;
+        }
+
+        template <class Source>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from(std::string sql, Source source) {
+            auto c = co_await acquire_connection();
+            if (!c) {
+                const auto &e = c.error();
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = e.code;
+                bad.error = e.error;
+                bad.err_detail = e.err_detail;
+                co_return bad;
+            }
+            auto conn = *c;
+            PgCopyResult r = co_await conn->copy_from(sql, source);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                mark_dead(conn);
+            } else {
+                co_await release_connection_async(conn);
+            }
+            co_return r;
+        }
+
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from_buffer(std::string sql, const void *data, size_t len);
 
         [[deprecated("password() leaks credentials; use make_conninfo internally")]]
         inline std::string password() { return std::string("***"); }

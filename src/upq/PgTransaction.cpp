@@ -40,7 +40,7 @@ namespace usub::pg
         : pool_(pool)
           , cfg_(cfg)
     {
-        if (cfg_.read_only && !cfg_.deferrable)
+        if (cfg_.read_only && !cfg_.deferrable && !cfg_.force_real_begin)
         {
             emulate_readonly_autocommit_ = true;
         }
@@ -404,5 +404,74 @@ namespace usub::pg
         committed_ = false;
         rolled_back_ = true;
         co_return;
+    }
+
+    usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
+    PgTransaction::stream(std::string sql, uint32_t batch_size) {
+        if (!active_ || !conn_ || !conn_->connected()) {
+            co_return std::unexpected(PgOpError{
+                PgErrorCode::InvalidFuture, "transaction not active", {}});
+        }
+
+        const std::string cursor_name = conn_->make_cursor_name();
+        QueryResult r = co_await conn_->cursor_declare_in_tx(cursor_name, sql);
+        if (!r.ok) {
+            PgOpError err{r.code, r.error, r.err_detail};
+            if (is_fatal_connection_error(r)) {
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                active_ = false;
+                rolled_back_ = true;
+            }
+            co_return std::unexpected(std::move(err));
+        }
+
+        PgRowStream s;
+        s.pool_ = nullptr;
+        s.conn_ = conn_;
+        s.cursor_name_ = cursor_name;
+        s.batch_size_ = batch_size ? batch_size : 1;
+        s.owns_tx_ = false;
+        s.active_ = true;
+        s.exhausted_ = false;
+        co_return std::expected<PgRowStream, PgOpError>{std::in_place, std::move(s)};
+    }
+
+    usub::uvent::task::Awaitable<PgCopyResult>
+    PgTransaction::copy_from_buffer(std::string sql, const void *data, size_t len) {
+        if (!active_ || !conn_ || !conn_->connected()) {
+            PgCopyResult bad{};
+            bad.ok = false;
+            bad.code = PgErrorCode::InvalidFuture;
+            bad.error = "transaction not active";
+            co_return bad;
+        }
+        PgCopyResult r = co_await conn_->copy_from_buffer(sql, data, len);
+        if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                      r.code == PgErrorCode::ConnectionClosed)) {
+            pool_->mark_dead(conn_);
+            conn_.reset();
+            active_ = false;
+            rolled_back_ = true;
+        }
+        co_return r;
+    }
+
+    usub::uvent::task::Awaitable<std::expected<std::string, PgOpError> >
+    PgTransaction::export_snapshot() {
+        if (!active_ || !conn_ || !conn_->connected()) {
+            co_return std::unexpected(PgOpError{
+                PgErrorCode::InvalidFuture, "transaction not active", {}});
+        }
+        co_return co_await conn_->export_snapshot();
+    }
+
+    usub::uvent::task::Awaitable<std::optional<PgOpError> >
+    PgTransaction::set_snapshot(const std::string &snapshot_id) {
+        if (!active_ || !conn_ || !conn_->connected()) {
+            co_return std::make_optional(PgOpError{
+                PgErrorCode::InvalidFuture, "transaction not active", {}});
+        }
+        co_return co_await conn_->set_snapshot(snapshot_id);
     }
 } // namespace usub::pg

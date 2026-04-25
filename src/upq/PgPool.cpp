@@ -31,6 +31,16 @@ namespace usub::pg {
 
     PgPool::~PgPool() = default;
 
+    void PgPool::close_all() {
+        std::shared_ptr<PgConnectionLibpq> conn;
+        while (this->idle_.try_dequeue(conn)) {
+            if (conn) {
+                conn->close();
+            }
+            conn.reset();
+        }
+    }
+
     usub::uvent::task::Awaitable<std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError> >
     PgPool::acquire_connection() {
         using namespace std::chrono_literals;
@@ -263,5 +273,71 @@ namespace usub::pg {
         conn->close();
         this->live_count_.fetch_sub(1, std::memory_order_relaxed);
         idle_sem_.release();
+    }
+
+    usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
+    PgPool::stream(std::string sql, uint32_t batch_size) {
+        auto c = co_await acquire_connection();
+        if (!c) co_return std::unexpected(c.error());
+
+        auto conn = *c;
+        const std::string cursor_name = conn->make_cursor_name();
+
+        {
+            QueryResult r = co_await conn->exec_simple_query_nonblocking("BEGIN;");
+            if (!r.ok) {
+                PgOpError err{r.code, r.error, r.err_detail};
+                if (is_fatal_connection_error(r)) mark_dead(conn);
+                else co_await release_connection_async(conn);
+                co_return std::unexpected(std::move(err));
+            }
+        }
+
+        {
+            QueryResult r = co_await conn->cursor_declare_in_tx(cursor_name, sql);
+            if (!r.ok) {
+                PgOpError err{r.code, r.error, r.err_detail};
+                if (is_fatal_connection_error(r)) {
+                    mark_dead(conn);
+                } else {
+                    co_await conn->exec_simple_query_nonblocking("ROLLBACK;");
+                    co_await release_connection_async(conn);
+                }
+                co_return std::unexpected(std::move(err));
+            }
+        }
+
+        PgRowStream s;
+        s.pool_ = this;
+        s.conn_ = std::move(conn);
+        s.cursor_name_ = cursor_name;
+        s.batch_size_ = batch_size ? batch_size : 1;
+        s.owns_tx_ = true;
+        s.active_ = true;
+        s.exhausted_ = false;
+        co_return std::expected<PgRowStream, PgOpError>{std::in_place, std::move(s)};
+    }
+
+    usub::uvent::task::Awaitable<PgCopyResult>
+    PgPool::copy_from_buffer(std::string sql, const void *data, size_t len) {
+        auto c = co_await acquire_connection();
+        if (!c) {
+            const auto &e = c.error();
+            PgCopyResult bad{};
+            bad.ok = false;
+            bad.code = e.code;
+            bad.error = e.error;
+            bad.err_detail = e.err_detail;
+            co_return bad;
+        }
+        auto conn = *c;
+        PgCopyResult r = co_await conn->copy_from_buffer(sql, data, len);
+        if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                      r.code == PgErrorCode::ConnectionClosed)) {
+            mark_dead(conn);
+        } else {
+            co_await release_connection_async(conn);
+        }
+        co_return r;
     }
 } // namespace usub::pg

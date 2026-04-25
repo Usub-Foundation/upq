@@ -30,6 +30,7 @@ namespace usub::pg {
         TxIsolationLevel isolation = TxIsolationLevel::Default;
         bool read_only = false;
         bool deferrable = false;
+        bool force_real_begin = false;
     };
 
     class PgTransaction {
@@ -388,6 +389,90 @@ namespace usub::pg {
                 "pg: $N placeholder count does not match argument count");
             return query_reflect_expected_one<T>(std::string(sv), std::forward<Args>(args)...);
         }
+
+        usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
+        stream(std::string sql, uint32_t batch_size = 1000);
+
+        template <class T>
+        usub::uvent::task::Awaitable<std::expected<PgTypedRowStream<T>, PgOpError> >
+        stream_reflect(std::string sql, uint32_t batch_size = 1000) {
+            auto s = co_await stream(std::move(sql), batch_size);
+            if (!s) co_return std::unexpected(s.error());
+            co_return std::expected<PgTypedRowStream<T>, PgOpError>{
+                std::in_place, PgTypedRowStream<T>{std::move(*s)}};
+        }
+
+        template <class Sink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to(std::string sql, Sink sink) {
+            if (!active_ || !conn_ || !conn_->connected()) {
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = PgErrorCode::InvalidFuture;
+                bad.error = "transaction not active";
+                co_return bad;
+            }
+            PgCopyResult r = co_await conn_->copy_to(sql, sink);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                active_ = false;
+                rolled_back_ = true;
+            }
+            co_return r;
+        }
+
+        template <class LineSink>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_to_lines(std::string sql, LineSink sink) {
+            if (!active_ || !conn_ || !conn_->connected()) {
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = PgErrorCode::InvalidFuture;
+                bad.error = "transaction not active";
+                co_return bad;
+            }
+            PgCopyResult r = co_await conn_->copy_to_lines(sql, sink);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                active_ = false;
+                rolled_back_ = true;
+            }
+            co_return r;
+        }
+
+        template <class Source>
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from(std::string sql, Source source) {
+            if (!active_ || !conn_ || !conn_->connected()) {
+                PgCopyResult bad{};
+                bad.ok = false;
+                bad.code = PgErrorCode::InvalidFuture;
+                bad.error = "transaction not active";
+                co_return bad;
+            }
+            PgCopyResult r = co_await conn_->copy_from(sql, source);
+            if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
+                          r.code == PgErrorCode::ConnectionClosed)) {
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                active_ = false;
+                rolled_back_ = true;
+            }
+            co_return r;
+        }
+
+        usub::uvent::task::Awaitable<PgCopyResult>
+        copy_from_buffer(std::string sql, const void *data, size_t len);
+
+        usub::uvent::task::Awaitable<std::expected<std::string, PgOpError> >
+        export_snapshot();
+
+        usub::uvent::task::Awaitable<std::optional<PgOpError> >
+        set_snapshot(const std::string &snapshot_id);
 
         usub::uvent::task::Awaitable<bool> commit();
 

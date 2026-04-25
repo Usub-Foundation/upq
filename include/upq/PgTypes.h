@@ -949,6 +949,7 @@ namespace usub::pg {
 
     struct PgCursorChunk {
         std::vector<QueryResult::Row> rows;
+        std::vector<std::string> columns;  // populated on first non-empty fetch
         bool done{false};
         bool ok{false};
         PgErrorCode code{PgErrorCode::Unknown};

@@ -54,6 +54,7 @@ nav:
   - Quickstart: quickstart.md
   - Connection Pool: pool.md
   - Transactions: transaction.md
+  - Large exports & bulk loads: large-exports.md
   - Routing: routing.md
   - Query Result: results.md
   - JSON (ujson): json.md

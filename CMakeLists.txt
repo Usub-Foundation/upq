@@ -119,6 +119,10 @@ if (UPQ_BUILD_EXAMPLES)
         target_link_libraries(upq_example_timeout PRIVATE upq)
         target_compile_definitions(upq_example_timeout PRIVATE DEV_STAGE=${DEV_STAGE})
 
+        add_executable(upq_example_large_exports examples/large_exports.cpp)
+        target_link_libraries(upq_example_large_exports PRIVATE upq)
+        target_compile_definitions(upq_example_large_exports PRIVATE DEV_STAGE=${DEV_STAGE})
+
         FetchContent_Declare(
                 ulog
                 GIT_REPOSITORY https://github.com/Usub-Foundation/ulog.git
