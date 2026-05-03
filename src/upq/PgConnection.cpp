@@ -188,11 +188,19 @@ namespace usub::pg {
 
     usub::uvent::task::Awaitable<bool> PgConnectionLibpq::pump_input() {
         for (;;) {
-            if (PQconsumeInput(conn_) == 0) {
-                connected_ = false;
-                co_return false;
+            for (;;) {
+                if (PQconsumeInput(conn_) == 0) {
+                    connected_ = false;
+                    co_return false;
+                }
+                if (!PQisBusy(conn_)) co_return true;
+
+                if (!sock_ || !sock_->get_raw_header()->has_unread_bytes()) {
+                    if (sock_) sock_->get_raw_header()->disarm_read();
+                    break;
+                }
             }
-            if (!PQisBusy(conn_)) co_return true;
+
             co_await wait_readable();
         }
     }
@@ -477,6 +485,17 @@ namespace usub::pg {
             }
 
             if (rc == 0) {
+                if (sock_ && sock_->get_raw_header()->has_unread_bytes()) {
+                    if (PQconsumeInput(conn_) == 0) {
+                        out.ok = false;
+                        out.err.code = PgErrorCode::SocketReadFailed;
+                        out.err.message = PQerrorMessage(conn_);
+                        connected_ = false;
+                        co_return out;
+                    }
+                    continue;
+                }
+                if (sock_) sock_->get_raw_header()->disarm_read();
                 co_await wait_readable();
                 if (PQconsumeInput(conn_) == 0) {
                     out.ok = false;

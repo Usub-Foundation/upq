@@ -796,21 +796,22 @@ namespace usub::pg {
         usub::uvent::task::Awaitable<PgCopyResult> copy_in_send_chunk(const void *data, size_t len);
 
         usub::uvent::task::Awaitable<PgCopyResult> copy_in_finish();
+
         usub::uvent::task::Awaitable<PgCopyResult> copy_in_finish(const char *error_msg);
 
         usub::uvent::task::Awaitable<PgCopyResult> copy_out_start(const std::string &sql);
 
         usub::uvent::task::Awaitable<PgWireResult<std::vector<uint8_t> > > copy_out_read_chunk();
 
-        template <class Sink>
+        template<class Sink>
         usub::uvent::task::Awaitable<PgCopyResult>
         copy_to(const std::string &sql, Sink &&sink);
 
-        template <class LineSink>
+        template<class LineSink>
         usub::uvent::task::Awaitable<PgCopyResult>
         copy_to_lines(const std::string &sql, LineSink &&line_sink);
 
-        template <class Source>
+        template<class Source>
         usub::uvent::task::Awaitable<PgCopyResult>
         copy_from(const std::string &sql, Source &&source);
 
@@ -847,7 +848,7 @@ namespace usub::pg {
                 co_return err;
             }
             const std::string stmt =
-                "DECLARE " + cursor_name + " NO SCROLL CURSOR FOR " + sql;
+                    "DECLARE " + cursor_name + " NO SCROLL CURSOR FOR " + sql;
             co_return co_await exec_param_query_nonblocking(
                 stmt, std::forward<Args>(args)...);
         }
@@ -979,76 +980,83 @@ namespace usub::pg {
         }
 
         for (;;) {
-            if (PQconsumeInput(conn_) == 0) {
-                out.code = PgErrorCode::SocketReadFailed;
-                out.error = PQerrorMessage(conn_);
-                connected_ = false;
-                co_return out;
-            }
+            for (;;) {
+                if (PQconsumeInput(conn_) == 0) {
+                    out.code = PgErrorCode::SocketReadFailed;
+                    out.error = PQerrorMessage(conn_);
+                    connected_ = false;
+                    co_return out;
+                }
 
-            bool saw_any = false;
-            while (PGresult *res = PQgetResult(conn_)) {
-                saw_any = true;
-                const auto st = PQresultStatus(res);
+                bool saw_any = false;
+                while (PGresult *res = PQgetResult(conn_)) {
+                    saw_any = true;
+                    const auto st = PQresultStatus(res);
 
-                if (st == PGRES_TUPLES_OK) {
-                    const int nrows = PQntuples(res);
-                    const int ncols = PQnfields(res);
+                    if (st == PGRES_TUPLES_OK) {
+                        const int nrows = PQntuples(res);
+                        const int ncols = PQnfields(res);
 
-                    if (out.columns.empty()) {
-                        out.columns.reserve(ncols);
-                        for (int c = 0; c < ncols; ++c) {
-                            const char *nm = PQfname(res, c);
-                            out.columns.emplace_back(nm ? nm : "");
-                        }
-                    }
-
-                    if (nrows > 0) out.rows.reserve(out.rows.size() + nrows);
-
-                    for (int r = 0; r < nrows; ++r) {
-                        QueryResult::Row row;
-                        row.cols.reserve(ncols);
-
-                        for (int c = 0; c < ncols; ++c) {
-                            if (PQgetisnull(res, r, c)) {
-                                row.cols.emplace_back();
-                            } else {
-                                const char *v = PQgetvalue(res, r, c);
-                                const int len = PQgetlength(res, r, c);
-                                row.cols.emplace_back(v, static_cast<size_t>(len));
+                        if (out.columns.empty()) {
+                            out.columns.reserve(ncols);
+                            for (int c = 0; c < ncols; ++c) {
+                                const char *nm = PQfname(res, c);
+                                out.columns.emplace_back(nm ? nm : "");
                             }
                         }
 
-                        out.rows.emplace_back(std::move(row));
+                        if (nrows > 0) out.rows.reserve(out.rows.size() + nrows);
+
+                        for (int r = 0; r < nrows; ++r) {
+                            QueryResult::Row row;
+                            row.cols.reserve(ncols);
+
+                            for (int c = 0; c < ncols; ++c) {
+                                if (PQgetisnull(res, r, c)) {
+                                    row.cols.emplace_back();
+                                } else {
+                                    const char *v = PQgetvalue(res, r, c);
+                                    const int len = PQgetlength(res, r, c);
+                                    row.cols.emplace_back(v, static_cast<size_t>(len));
+                                }
+                            }
+
+                            out.rows.emplace_back(std::move(row));
+                        }
+
+                        out.ok = true;
+                        out.code = PgErrorCode::OK;
+                        if (out.rows_affected == 0) out.rows_affected = static_cast<uint64_t>(nrows);
+                    } else if (st == PGRES_COMMAND_OK) {
+                        out.ok = true;
+                        out.code = PgErrorCode::OK;
+                        out.rows_affected += extract_rows_affected(res);
+                    } else {
+                        fill_server_error_fields(res, out);
                     }
 
-                    out.ok = true;
-                    out.code = PgErrorCode::OK;
-                    if (out.rows_affected == 0) out.rows_affected = static_cast<uint64_t>(nrows);
-                } else if (st == PGRES_COMMAND_OK) {
-                    out.ok = true;
-                    out.code = PgErrorCode::OK;
-                    out.rows_affected += extract_rows_affected(res);
-                } else {
-                    fill_server_error_fields(res, out);
+                    PQclear(res);
                 }
 
-                PQclear(res);
-            }
-
-            if (!PQisBusy(conn_)) {
-                if (saw_any && out.error.empty()) {
-                    out.ok = true;
-                    out.code = PgErrorCode::OK;
+                if (!PQisBusy(conn_)) {
+                    if (saw_any && out.error.empty()) {
+                        out.ok = true;
+                        out.code = PgErrorCode::OK;
+                    }
+                    co_return out;
                 }
-                co_return out;
+
+                if (!sock_ || !sock_->get_raw_header()->has_unread_bytes()) {
+                    if (sock_) sock_->get_raw_header()->disarm_read();
+                    break;
+                }
             }
 
             co_await wait_readable();
         }
     }
 
-    template <class Sink>
+    template<class Sink>
     usub::uvent::task::Awaitable<PgCopyResult>
     PgConnectionLibpq::copy_to(const std::string &sql, Sink &&sink) {
         PgCopyResult start = co_await copy_out_start(sql);
@@ -1091,35 +1099,35 @@ namespace usub::pg {
         co_return final_result;
     }
 
-    template <class LineSink>
+    template<class LineSink>
     usub::uvent::task::Awaitable<PgCopyResult>
     PgConnectionLibpq::copy_to_lines(const std::string &sql,
                                      LineSink &&line_sink) {
         std::string carry;
 
         auto chunk_sink =
-            [&](std::string_view sv) -> usub::uvent::task::Awaitable<bool> {
-                size_t pos = 0;
-                while (pos < sv.size()) {
-                    const auto nl = sv.find('\n', pos);
-                    if (nl == std::string_view::npos) {
-                        carry.append(sv.data() + pos, sv.size() - pos);
-                        break;
-                    }
-                    std::string_view line;
-                    if (!carry.empty()) {
-                        carry.append(sv.data() + pos, nl - pos);
-                        line = std::string_view(carry);
-                    } else {
-                        line = std::string_view(sv.data() + pos, nl - pos);
-                    }
-                    bool keep = co_await line_sink(line);
-                    carry.clear();
-                    if (!keep) co_return false;
-                    pos = nl + 1;
+                [&](std::string_view sv) -> usub::uvent::task::Awaitable<bool> {
+            size_t pos = 0;
+            while (pos < sv.size()) {
+                const auto nl = sv.find('\n', pos);
+                if (nl == std::string_view::npos) {
+                    carry.append(sv.data() + pos, sv.size() - pos);
+                    break;
                 }
-                co_return true;
-            };
+                std::string_view line;
+                if (!carry.empty()) {
+                    carry.append(sv.data() + pos, nl - pos);
+                    line = std::string_view(carry);
+                } else {
+                    line = std::string_view(sv.data() + pos, nl - pos);
+                }
+                bool keep = co_await line_sink(line);
+                carry.clear();
+                if (!keep) co_return false;
+                pos = nl + 1;
+            }
+            co_return true;
+        };
 
         PgCopyResult r = co_await copy_to(sql, chunk_sink);
 
@@ -1135,7 +1143,7 @@ namespace usub::pg {
         co_return r;
     }
 
-    template <class Source>
+    template<class Source>
     usub::uvent::task::Awaitable<PgCopyResult>
     PgConnectionLibpq::copy_from(const std::string &sql, Source &&source) {
         PgCopyResult start = co_await copy_in_start(sql);
