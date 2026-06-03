@@ -1220,6 +1220,64 @@ usub::uvent::task::Awaitable<void> routing_example() {
     co_return;
 }
 
+struct LeaderProbe {
+    bool is_primary;
+    std::string server;
+};
+
+usub::uvent::task::Awaitable<void> auto_leader_routing_example() {
+    using namespace usub::pg;
+    using namespace std::chrono_literals;
+
+    PgConnector router = PgConnectorBuilder{}
+            .node("pg-a", "localhost", "12432", "postgres", "postgres", "password", NodeRole::Primary, 1, 16)
+            .node("pg-b", "localhost", "12432", "postgres", "postgres", "password", NodeRole::AsyncReplica, 1, 16)
+            .node("pg-c", "localhost", "12432", "postgres", "postgres", "password", NodeRole::AsyncReplica, 1, 16)
+            .primary_failover({"pg-a", "pg-b", "pg-c"})
+            .default_consistency(Consistency::BoundedStaleness)
+            .bounded_staleness(150ms, 0)
+            .pool_limits(64, 16)
+            .health(1000, 200, "SELECT 1")
+            .auto_detect_leader(true)
+            .leader_probe_sql("SELECT pg_is_in_recovery() = false")
+            .build();
+
+    usub::uvent::system::co_spawn(router.start_health_loop());
+    co_await usub::uvent::system::this_coroutine::sleep_for(1500ms);
+
+    const char *leader_sql =
+            "SELECT NOT pg_is_in_recovery() AS is_primary, "
+            "COALESCE(host(inet_server_addr()) || ':' || inet_server_port()::text, 'local') AS server";
+
+    RouteHint write_hint{.kind = QueryKind::Write, .consistency = Consistency::Strong};
+    RouteHint read_hint{.kind = QueryKind::Read, .consistency = Consistency::Eventual};
+
+    for (int i = 0; i < 5; ++i) {
+        if (auto *wp = router.route(write_hint)) {
+            auto who = co_await wp->query_reflect_expected_one<LeaderProbe>(leader_sql);
+            if (who && who->is_primary)
+                std::cout << "[AUTO-LEADER] write -> current leader " << who->server << "\n";
+            else if (who)
+                std::cout << "[AUTO-LEADER] write -> non-leader " << who->server << " (failover in progress?)\n";
+            else
+                std::cout << "[AUTO-LEADER] write leader probe failed: " << toString(who.error().code) << "\n";
+        } else {
+            std::cout << "[AUTO-LEADER] no writable leader elected yet\n";
+        }
+
+        if (auto *rp = router.route(read_hint)) {
+            auto who = co_await rp->query_reflect_expected_one<LeaderProbe>(leader_sql);
+            if (who)
+                std::cout << "[AUTO-LEADER] read  -> " << who->server
+                        << (who->is_primary ? " (leader)\n" : " (replica)\n");
+        }
+
+        co_await usub::uvent::system::this_coroutine::sleep_for(1000ms);
+    }
+
+    co_return;
+}
+
 struct UserErrorRow {
     int id;
     std::string name;
@@ -1713,6 +1771,7 @@ int main() {
     system::co_spawn(test_reflect_query(pool));
     system::co_spawn(tx_reflect_example(pool));
     system::co_spawn(routing_example());
+    system::co_spawn(auto_leader_routing_example());
     system::co_spawn(decode_fail_example(pool));
     system::co_spawn(expected_reflect_example(pool));
     system::co_spawn(test_enum_support(pool));

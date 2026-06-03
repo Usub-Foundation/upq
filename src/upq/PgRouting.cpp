@@ -179,6 +179,19 @@ namespace usub::pg {
 
 
     PgConnector::Node *PgConnector::pick_primary() {
+        if (this->cfg_.health.auto_detect_leader) {
+            for (auto idx: this->primary_failover_idx_) {
+                auto &n = this->nodes_[idx];
+                if (n.stats.is_primary && this->is_usable(n.ep.role) && n.cb_state != 2 && n.stats.healthy && n.pool)
+                    return &n;
+            }
+            for (auto &n: this->nodes_)
+                if (n.stats.is_primary && this->is_usable(n.ep.role) && n.cb_state != 2 && n.stats.healthy && n.pool)
+                    return &n;
+            for (auto &n: this->nodes_)
+                if (n.stats.is_primary && this->is_usable(n.ep.role) && n.cb_state != 2 && n.pool)
+                    return &n;
+        }
         for (auto idx: this->primary_failover_idx_) {
             auto &n = this->nodes_[idx];
             if (n.ep.role == NodeRole::Primary && this->is_usable(n.ep.role) && n.cb_state != 2 && n.stats.healthy && n.
@@ -213,7 +226,8 @@ namespace usub::pg {
     }
 
     PgConnector::Node *PgConnector::pick_any(bool prefer_primary) {
-        Node *primary = nullptr;
+        Node *detected = nullptr;
+        Node *configured = nullptr;
         Node *any_replica = nullptr;
 
         for (auto &n: this->nodes_) {
@@ -222,12 +236,12 @@ namespace usub::pg {
             if (!n.pool && !this->ensure_pool(n))
                 continue;
 
-            if (n.ep.role == NodeRole::Primary) {
-                if (!primary) primary = &n;
-            } else if (this->is_replica(n.ep.role)) {
-                if (!any_replica) any_replica = &n;
-            }
+            if (n.stats.is_primary && !detected) detected = &n;
+            if (n.ep.role == NodeRole::Primary && !configured) configured = &n;
+            if (this->is_replica(n.ep.role) && !any_replica) any_replica = &n;
         }
+
+        Node *primary = (this->cfg_.health.auto_detect_leader && detected) ? detected : configured;
 
         if (prefer_primary)
             return primary ? primary : any_replica;
@@ -257,6 +271,13 @@ namespace usub::pg {
     usub::uvent::task::Awaitable<bool> PgConnector::probe_healthy(PgPool &pool) {
         auto qr = co_await pool.query_awaitable("SELECT 1");
         co_return qr.ok;
+    }
+
+    usub::uvent::task::Awaitable<bool> PgConnector::probe_is_primary(PgPool &pool) {
+        auto qr = co_await pool.query_awaitable(this->cfg_.health.leader_probe_sql);
+        if (!qr.ok || qr.rows.empty() || qr.rows[0].cols.empty()) co_return false;
+        const std::string &v = qr.rows[0].cols[0];
+        co_return v == "t" || v == "true" || v == "1";
     }
 
     usub::uvent::task::Awaitable<std::chrono::milliseconds>
@@ -290,14 +311,20 @@ namespace usub::pg {
                 continue;
             }
             bool ok = co_await this->probe_healthy(*n.pool);
+            bool is_primary = (ok && this->cfg_.health.auto_detect_leader)
+                                  ? co_await this->probe_is_primary(*n.pool)
+                                  : (n.ep.role == NodeRole::Primary);
             auto rtt = co_await this->probe_rtt(*n.pool, this->cfg_.health.rtt_probe_sql);
             auto [lag_ms, lsn_lag] = co_await this->probe_replication_lag(*n.pool);
             n.stats.healthy = ok;
+            n.stats.is_primary = is_primary;
             n.stats.rtt = rtt;
             n.stats.replay_lag = lag_ms;
             n.stats.lsn_lag = lsn_lag;
-            if (n.stats.replay_lag > lag_thr) n.stats.healthy = false;
-            if (n.ep.role == NodeRole::Primary && n.stats.replay_lag.count() > 0) n.stats.healthy = false;
+            if (!is_primary && n.stats.replay_lag > lag_thr) n.stats.healthy = false;
+            if (!this->cfg_.health.auto_detect_leader &&
+                n.ep.role == NodeRole::Primary && n.stats.replay_lag.count() > 0)
+                n.stats.healthy = false;
             this->apply_circuit_breaker(n, n.stats.healthy);
         }
         co_return;

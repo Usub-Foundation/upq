@@ -60,6 +60,16 @@ namespace usub::pg {
             return *this;
         }
 
+        PgConnectorBuilder &auto_detect_leader(bool on) {
+            this->cfg_.health.auto_detect_leader = on;
+            return *this;
+        }
+
+        PgConnectorBuilder &leader_probe_sql(std::string sql) {
+            this->cfg_.health.leader_probe_sql = std::move(sql);
+            return *this;
+        }
+
         template<typename CFG>
         PgConnectorBuilder &ssl_config(CFG &&ssl_config) requires std::same_as<std::remove_cvref_t<CFG>, SSLConfig> {
             this->cfg_.ssl_config = std::forward<CFG>(ssl_config);

@@ -36,6 +36,7 @@ replication lag, and health status.
 Each node tracks:
 
 * `healthy` (pinged via `SELECT 1`)
+* `is_primary` (live leader/primary status, probed each health tick — see [Automatic Leader Detection](#automatic-leader-detection))
 * Round-trip time (`rtt`)
 * Replication lag (`replay_lag`, `lsn_lag`)
 * Circuit breaker state (prevents retry storms)
@@ -57,6 +58,17 @@ struct RoutingCfg {
     Consistency default_consistency{Consistency::Eventual};
     BoundedStalenessCfg bounded_staleness{std::chrono::milliseconds{150}, 0};
     uint32_t read_my_writes_ttl_ms{500};
+};
+
+struct HealthCfg {
+    uint32_t interval_ms{500};
+    uint32_t lag_threshold_ms{120};
+    std::string rtt_probe_sql{"SELECT 1"};
+    uint32_t cb_quiet_ms{500};
+    uint32_t cb_backoff_ms{1000};
+    uint32_t cb_max_ms{1500};
+    bool auto_detect_leader{true};                          // follow the live leader across failovers
+    std::string leader_probe_sql{"SELECT NOT pg_is_in_recovery()"};  // overridable leader check
 };
 
 struct Config {
@@ -90,8 +102,14 @@ PgConnector router = PgConnectorBuilder{}
   .read_my_writes_ttl(500ms)
   .pool_limits(64,16)
   .health(500,120,"SELECT 1")
+  .auto_detect_leader(true)                       // optional: on by default
+  .leader_probe_sql("SELECT NOT pg_is_in_recovery()")  // optional: override the leader check
   .build();
 ```
+
+> `auto_detect_leader` defaults to `true` and `leader_probe_sql` defaults to
+> `SELECT NOT pg_is_in_recovery()`, so neither call is required. Add them only to
+> opt out of auto-detection or to plug in a custom topology check (e.g. Patroni).
 
 ### B) Using `Config` directly
 
@@ -128,11 +146,16 @@ usub::uvent::task::Awaitable<void> health_loop(PgConnector& r) {
 This updates per-node:
 
 * `healthy`
+* `is_primary` (when `auto_detect_leader` is enabled — runs `leader_probe_sql` on each live node)
 * `rtt`
 * `replay_lag`, `lsn_lag`
 * Circuit breaker state
 
 Unhealthy nodes are excluded from routing until recovery.
+
+> `start_health_loop()` is a convenience coroutine that runs `health_tick()` on the
+> configured `health.interval_ms` cadence — `co_spawn` it once instead of writing your
+> own loop.
 
 ---
 
@@ -287,8 +310,68 @@ PgPool* route_read() {
 
 ### 10) Automatic Failover
 
-If `Primary` becomes unhealthy, router automatically falls back to the next node listed in `primary_failover`.
-Once that node is promoted to `Primary`, rebuild and swap the connector.
+If `Primary` becomes unhealthy, the router automatically falls back to the next node listed in `primary_failover`.
+When a replica is promoted by your cluster manager (Patroni, repmgr, managed RDS/Aurora, etc.), the router picks up
+the new leader on the next health tick — see [Automatic Leader Detection](#automatic-leader-detection) below. You do
+**not** need to rebuild the connector, swap it, or restart the process.
+
+---
+
+## 👑 Automatic Leader Detection
+
+`auto_detect_leader` (enabled by default) lets the router follow the **current** primary at runtime instead of
+trusting the static `NodeRole::Primary` you configured. This means a replica failover/promotion is handled without
+restarting the pod or editing code.
+
+### How it works
+
+On every `health_tick()`, each reachable node is asked whether it is the leader by running `leader_probe_sql`
+(default `SELECT NOT pg_is_in_recovery()`). The result updates `NodeStats::is_primary`, and write/strong routing
+(`route`, `route_for_tx`) prefers the node that **reports** it is the leader — falling back to the configured role and
+`primary_failover` order only when no leader has been detected yet.
+
+The probe reads the **first column of the first row** as a boolean (`t`/`true`/`1` → leader), so it is independent of
+the column name. Any SQL returning a single boolean works.
+
+```cpp
+PgConnector router = PgConnectorBuilder{}
+    .node("pg-a","10.0.0.1","5432","app","db","***", NodeRole::Primary,1,64)
+    .node("pg-b","10.0.0.2","5432","app","db","***", NodeRole::AsyncReplica,1,64)
+    .node("pg-c","10.0.0.3","5432","app","db","***", NodeRole::AsyncReplica,1,64)
+    .primary_failover({"pg-a","pg-b","pg-c"})
+    .health(1000,200,"SELECT 1")
+    .auto_detect_leader(true)
+    .build();
+
+usub::uvent::system::co_spawn(router.start_health_loop());
+
+// After a failover the next write follows the new leader automatically — no restart.
+RouteHint write{ .kind = QueryKind::Write, .consistency = Consistency::Strong };
+if (auto* p = router.route(write))
+    co_await p->query_awaitable("INSERT INTO audit(event) VALUES ('login')");
+```
+
+### Overriding the probe
+
+Point `leader_probe_sql` at whatever defines leadership in your topology — as long as it returns one boolean row:
+
+```cpp
+// equivalent rephrasing of the default
+.leader_probe_sql("SELECT pg_is_in_recovery() = false")
+
+// example: only accept a primary that has a connected synchronous standby
+.leader_probe_sql(
+  "SELECT NOT pg_is_in_recovery() "
+  "AND EXISTS (SELECT 1 FROM pg_stat_replication WHERE sync_state = 'sync')")
+```
+
+### Opting out
+
+Set `auto_detect_leader(false)` to keep the legacy behavior: writes go strictly to the node configured as
+`NodeRole::Primary` (and then down the `primary_failover` list). Use this when an external proxy already guarantees
+the primary endpoint.
+
+> A runnable end-to-end demo lives in `examples/main.cpp` (`auto_leader_routing_example`).
 
 ---
 

@@ -46,6 +46,7 @@ namespace usub::pg
     struct NodeStats
     {
         bool healthy{false};
+        bool is_primary{false};
         std::chrono::milliseconds rtt{0};
         std::chrono::milliseconds replay_lag{0};
         uint64_t lsn_lag{0};
@@ -74,6 +75,8 @@ namespace usub::pg
         uint32_t cb_quiet_ms{500};
         uint32_t cb_backoff_ms{1000};
         uint32_t cb_max_ms{1500};
+        bool auto_detect_leader{true};
+        std::string leader_probe_sql{"SELECT NOT pg_is_in_recovery()"};
     };
 
     struct RoutingCfg
@@ -140,6 +143,7 @@ namespace usub::pg
         static bool is_replica(NodeRole r);
         static bool is_usable(NodeRole r);
         usub::uvent::task::Awaitable<bool> probe_healthy(PgPool& pool);
+        usub::uvent::task::Awaitable<bool> probe_is_primary(PgPool& pool);
         usub::uvent::task::Awaitable<std::chrono::milliseconds> probe_rtt(PgPool& pool, const std::string& sql);
         usub::uvent::task::Awaitable<std::pair<std::chrono::milliseconds, uint64_t>>
         probe_replication_lag(PgPool& pool);
