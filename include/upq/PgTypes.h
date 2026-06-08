@@ -3,7 +3,8 @@
 
 #include <libpq-fe.h>
 #include <openssl/md5.h>
-#include <ujson/ujson.h>
+
+#include "PgJsonCodec.h"
 
 #include <atomic>
 #include <charconv>
@@ -660,12 +661,11 @@ namespace usub::pg {
                     return std::unexpected(std::move(e));
                 }
 
-                auto parsed = ::ujson::try_parse<Inner, Strict>(std::string(sv));
+                auto parsed = ::usub::pg::json::parse<Inner, Strict>(sv);
                 if (!parsed) {
                     PgOpError e;
                     e.code = PgErrorCode::ProtocolCorrupt;
-                    e.error = std::string("ujson parse failed: ") +
-                              (parsed.error().msg ? parsed.error().msg : "<null>");
+                    e.error = std::move(parsed.error());
                     return std::unexpected(std::move(e));
                 }
 

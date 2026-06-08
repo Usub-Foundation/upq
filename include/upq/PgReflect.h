@@ -1,8 +1,9 @@
 #ifndef PGREFLECT_H
 #define PGREFLECT_H
 
-#include <ujson/ujson.h>
 #include <ureflect/ureflect_auto.h>
+
+#include "PgJsonCodec.h"
 
 #include <algorithm>
 #include <array>
@@ -441,7 +442,7 @@ namespace usub::pg {
         struct Decoder<::usub::pg::PgJson<T, Strict>, void> {
             static bool apply(std::string_view sv, ::usub::pg::PgJson<T, Strict> &out) {
                 if (sv.empty()) return false;
-                auto r = ::ujson::try_parse<T, Strict>(sv);
+                auto r = ::usub::pg::json::parse<T, Strict>(sv);
                 if (!r) return false;
                 out.value = std::move(*r);
                 return true;
