@@ -1,4 +1,4 @@
-# JSON (ujson)
+# JSON
 
 UPQ supports:
 
@@ -6,7 +6,164 @@ UPQ supports:
 - reading `JSONB/JSON` into C++ structs via `PgJson<T, Strict>`
 - strict vs non-strict parsing (unknown keys, etc.)
 
-This integration uses **ujson**.
+All JSON (de)serialization funnels through a single, swappable codec —
+`usub::pg::json::dump` / `usub::pg::json::parse` (see
+[`include/upq/PgJsonCodec.h`](../include/upq/PgJsonCodec.h)). The default
+engine is **ujson** and is the only hard dependency; you can switch the whole
+library to **glaze** or **nlohmann/json**, or override serialization for a
+single type, without touching UPQ's source. See
+[Pluggable JSON backend](#pluggable-json-backend) below.
+
+---
+
+## Pluggable JSON backend
+
+Everything in UPQ that touches JSON goes through two functions:
+
+```cpp
+std::string                     usub::pg::json::dump(const T& v);
+std::expected<T, std::string>   usub::pg::json::parse<T, Strict>(std::string_view);
+```
+
+There are three independent ways to customize them, all resolved at compile time:
+
+1. pick a **built-in** backend (ujson / glaze / nlohmann)
+2. plug in **your own** backend, entirely from code
+3. **override a single type** with `custom_codec<T>`
+
+And the choice can be driven **from CMake or from code** — see
+[Switching the backend from code](#switching-the-backend-from-code-no-cmake).
+
+### 1. Pick a global backend (works out of the box, no per-type code)
+
+Selection is **compile-time**. The third-party header is `#include`d **only**
+when its backend is selected, so glaze / nlohmann are never a hard dependency —
+you only need them on the include path if you opt in.
+
+| Backend         | Macro                        | Works out of the box for plain structs?                    |
+|-----------------|------------------------------|------------------------------------------------------------|
+| `ujson` (default) | *(none)*                   | Yes (ureflect aggregate reflection)                        |
+| `glaze`         | `UPQ_JSON_BACKEND_GLAZE`     | Yes (glaze compile-time reflection)                        |
+| `nlohmann/json` | `UPQ_JSON_BACKEND_NLOHMANN`  | Via nlohmann conventions (`NLOHMANN_DEFINE_TYPE_*` / ADL)  |
+
+With CMake:
+
+```bash
+cmake -DUPQ_JSON_BACKEND=ujson      # default
+cmake -DUPQ_JSON_BACKEND=glaze      # find_package(glaze) + link glaze::glaze
+cmake -DUPQ_JSON_BACKEND=nlohmann   # find_package(nlohmann_json) + link it
+```
+
+`UPQ_JSON_BACKEND=glaze|nlohmann` will `find_package(...)` that library and
+link it `PUBLIC`; ujson stays the default and nothing extra is pulled in
+otherwise. You can also define the macro directly (e.g. `-DUPQ_JSON_BACKEND_GLAZE`).
+
+`Strict` (from `PgJson<T, Strict>`) maps to unknown-key rejection: ujson and
+glaze enforce it; nlohmann has no such notion, so `Strict` is accepted but not
+enforced there.
+
+> nlohmann note: nlohmann only (de)serializes types that follow its own
+> conventions (`NLOHMANN_DEFINE_TYPE_INTRUSIVE`, `to_json`/`from_json`, etc.),
+> and does not handle `std::optional<T>::from_json` by itself — add the usual
+> `adl_serializer<std::optional<T>>` if your structs use it.
+
+### Switching the backend from code (no CMake)
+
+CMake's `-DUPQ_JSON_BACKEND=...` is only a convenience that sets the macros
+above. You can select the backend **purely from C++**, without touching the
+build system, with an auto-discovered config header.
+
+Drop a header named **`upq_json_config.h`** anywhere on your include path. UPQ
+includes it (identically in every translation unit, *before* it resolves the
+backend), so whatever you `#define` there wins:
+
+```cpp
+// upq_json_config.h  — found via __has_include, no -D needed
+#pragma once
+#define UPQ_JSON_BACKEND_GLAZE 1
+```
+
+Prefer a different name/location? Point `UPQ_JSON_CONFIG_HEADER` at it instead
+(e.g. `-DUPQ_JSON_CONFIG_HEADER="\"my/json_cfg.h\""`, or define it before the
+first UPQ include).
+
+> Because the choice is compile-time, it must be **consistent across all
+> translation units** (same as any ODR-sensitive config). The config-header
+> approach guarantees that automatically; defining the macro ad-hoc in a single
+> `.cpp` does not.
+
+### Plug in your own backend (any JSON library, from code)
+
+Not limited to the three built-ins — point UPQ at a backend type you define.
+No edits to `PgJsonCodec.h`, no CMake. A backend is just a type with three
+members mirroring the built-ins:
+
+```cpp
+// in upq_json_config.h (or any header seen before UPQ's)
+namespace my {
+struct JsonBackend {
+    static constexpr std::string_view name = "my";
+
+    template <class T>
+    static std::string dump(const T& v);                       // C++ -> JSON text
+
+    template <class T, bool Strict>
+    static std::expected<T, std::string> parse(std::string_view sv);  // JSON -> C++
+};
+}
+#define UPQ_JSON_BACKEND_CUSTOM ::my::JsonBackend
+```
+
+`UPQ_JSON_BACKEND_CUSTOM` takes priority over the built-in backends. Your
+backend owns its own `#include`s, so this is the seam for wiring in simdjson,
+RapidJSON, Boost.JSON, a hand-rolled serializer, or even a runtime dispatcher.
+
+### Generic / dynamic JSON (DOM)
+
+For schemaless columns you don't want to model as a struct, use the backend's
+generic JSON value as the `T` in `PgJson<T>` / `pg_jsonb(T)`. It flows through
+the codec unchanged, so reading/writing arbitrary JSON works out of the box:
+
+| Backend       | Generic value type                                  |
+|---------------|-----------------------------------------------------|
+| glaze         | `glz::generic` (a.k.a. deprecated `glz::json_t`)    |
+| nlohmann/json | `nlohmann::json`                                    |
+| ujson         | — (reflection-only; no DOM type)                    |
+
+```cpp
+// glaze backend: read a dynamic JSONB column into a DOM, then write it back
+struct Row {
+    int64_t id{};
+    usub::pg::PgJson<glz::generic> doc;     // any JSON shape
+};
+
+glz::generic d;
+d["tags"] = glz::generic::array_t{};
+auto ins = co_await pool.exec_reflect(
+    "INSERT INTO t(doc) VALUES($1)", std::tuple{usub::pg::pg_jsonb(d)});
+```
+
+`glz::generic` is available straight from `<glaze/glaze.hpp>` (which the codec
+already includes); no extra header is needed.
+
+### 2. Override a single type (wins over any global backend)
+
+Specialize `usub::pg::json::custom_codec<T>` to control one type regardless of
+which backend is selected. A per-type override always wins:
+
+```cpp
+namespace usub::pg::json {
+    template <>
+    struct custom_codec<MyType> {
+        static std::string dump(const MyType& v);
+        static std::expected<MyType, std::string>
+        parse(std::string_view sv, bool strict);
+    };
+}
+```
+
+Use this when one type needs hand-rolled JSON (e.g. a domain wrapper) while the
+rest of the codebase keeps using the global backend.
 
 ---
 
@@ -45,8 +202,8 @@ Use `pg_jsonb()` in almost all cases.
 
 ## Serialization (C++ → JSON/JSONB)
 
-UPQ serializes C++ objects into JSON by calling `ujson::dump(obj)` inside the parameter encoder and sends the result as
-a typed parameter:
+UPQ serializes C++ objects into JSON by calling `usub::pg::json::dump(obj)` (the active backend, ujson by default)
+inside the parameter encoder and sends the result as a typed parameter:
 
 - `pg_jsonb(obj)` → parameter type `JSONBOID` (JSONB)
 - `pg_json(obj)`  → parameter type `JSONOID`  (JSON)
@@ -90,7 +247,7 @@ auto r = co_await pool.exec_reflect(
 
 ### Important details
 
-* Serialization uses `ujson::dump()` (string JSON).
+* Serialization uses `usub::pg::json::dump()` (the selected backend; ujson by default).
 * The parameter is sent as **text format** with an explicit OID (`JSONBOID` / `JSONOID`).
 * `Strict` in `PgJsonParam<T, Strict, ...>` currently does **not** change serialization; it matters on **decode** (
   `PgJson<T, Strict>`).

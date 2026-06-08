@@ -77,6 +77,39 @@ if (TARGET PostgreSQL::pq)
         target_link_libraries(upq PUBLIC PostgreSQL::pq)
 endif()
 
+# ---- pluggable JSON backend -------------------------------------------------
+# UPQ (de)serializes C++ structs to/from JSON through usub::pg::json (see
+# include/upq/PgJsonCodec.h). The engine is compile-time selectable. ujson is
+# the default and the only hard dependency; glaze / nlohmann are pulled in ONLY
+# when explicitly selected, so neither is forced on downstream users.
+#
+#   cmake -DUPQ_JSON_BACKEND=ujson      # default
+#   cmake -DUPQ_JSON_BACKEND=glaze      # needs glaze on the include path
+#   cmake -DUPQ_JSON_BACKEND=nlohmann   # needs nlohmann_json on the include path
+set(UPQ_JSON_BACKEND "ujson" CACHE STRING "JSON backend for UPQ (ujson|glaze|nlohmann)")
+set_property(CACHE UPQ_JSON_BACKEND PROPERTY STRINGS ujson glaze nlohmann)
+
+if (UPQ_JSON_BACKEND STREQUAL "glaze")
+        # Reuse an already-provided target (e.g. via FetchContent); else locate it.
+        if (NOT TARGET glaze::glaze)
+                find_package(glaze CONFIG REQUIRED)
+        endif()
+        target_link_libraries(upq PUBLIC glaze::glaze)
+        target_compile_definitions(upq PUBLIC UPQ_JSON_BACKEND_GLAZE=1)
+        message(STATUS "UPQ JSON backend: glaze")
+elseif (UPQ_JSON_BACKEND STREQUAL "nlohmann")
+        if (NOT TARGET nlohmann_json::nlohmann_json)
+                find_package(nlohmann_json CONFIG REQUIRED)
+        endif()
+        target_link_libraries(upq PUBLIC nlohmann_json::nlohmann_json)
+        target_compile_definitions(upq PUBLIC UPQ_JSON_BACKEND_NLOHMANN=1)
+        message(STATUS "UPQ JSON backend: nlohmann/json")
+elseif (UPQ_JSON_BACKEND STREQUAL "ujson")
+        message(STATUS "UPQ JSON backend: ujson (default)")
+else ()
+        message(FATAL_ERROR "UPQ_JSON_BACKEND must be one of: ujson, glaze, nlohmann (got '${UPQ_JSON_BACKEND}')")
+endif()
+
 if (UPQ_HARDENING)
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
                 target_compile_options(upq PRIVATE

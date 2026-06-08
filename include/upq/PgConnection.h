@@ -24,8 +24,8 @@
 #include <vector>
 
 #include <libpq-fe.h>
-#include <ujson/ujson.h>
 
+#include "PgJsonCodec.h"
 #include "PgReflect.h"
 #include "PgTypes.h"
 #include "meta/PgConcepts.h"
@@ -316,7 +316,7 @@ namespace usub::pg {
                 return;
             }
 
-            std::string s = ::ujson::dump(*p.ptr);
+            std::string s = ::usub::pg::json::dump(*p.ptr);
             ps.set_text_typed(s, Jsonb ? ::usub::pg::detail::JSONBOID : ::usub::pg::detail::JSONOID);
         }
 
