@@ -3,6 +3,12 @@
 
 #include <libpq-fe.h>
 
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <sys/ioctl.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -182,24 +188,41 @@ namespace usub::pg {
                     continue;
                 }
 
-                if (PQconsumeInput(raw) == 0) {
-                    if (PQstatus(raw) == CONNECTION_BAD) {
-                        continue;
+                // The poller is edge-triggered, so a single PQconsumeInput per
+                // wakeup is not enough: when a NOTIFY burst is larger than one
+                // read (~16 KiB), the rest stays in the kernel socket buffer,
+                // no new edge ever fires, and the tail of the burst is stuck
+                // until an unrelated notification arrives. Drain the socket
+                // completely before waiting again.
+                for (;;) {
+                    if (PQconsumeInput(raw) == 0) {
+                        break;
                     }
-                    continue;
-                }
 
-                while (true) {
-                    PGnotify *n = PQnotifies(raw);
-                    if (!n) break;
+                    while (true) {
+                        PGnotify *n = PQnotifies(raw);
+                        if (!n) break;
 
-                    const char *ch_raw = n->relname ? n->relname : "";
-                    const char *pl_raw = n->extra ? n->extra : "";
-                    int be_pid = n->be_pid;
+                        const char *ch_raw = n->relname ? n->relname : "";
+                        const char *pl_raw = n->extra ? n->extra : "";
+                        int be_pid = n->be_pid;
 
-                    dispatch_event(ch_raw, pl_raw, be_pid);
+                        dispatch_event(ch_raw, pl_raw, be_pid);
 
-                    PQfreemem(n);
+                        PQfreemem(n);
+                    }
+
+#ifdef _WIN32
+                    u_long pending = 0;
+                    if (ioctlsocket(PQsocket(raw), FIONREAD, &pending) != 0 || pending == 0) {
+                        break;
+                    }
+#else
+                    int pending = 0;
+                    if (ioctl(PQsocket(raw), FIONREAD, &pending) != 0 || pending <= 0) {
+                        break;
+                    }
+#endif
                 }
             }
 
