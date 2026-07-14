@@ -989,7 +989,14 @@ namespace usub::pg {
                 }
 
                 bool saw_any = false;
-                while (PGresult *res = PQgetResult(conn_)) {
+                // PQgetResult blocks inside libpq (poll on the socket) while
+                // the query is still executing server-side; only call it when
+                // PQisBusy says a result is ready. Otherwise a slow query
+                // (e.g. a contended pg_advisory_xact_lock) parks the whole
+                // worker thread instead of suspending the coroutine.
+                while (!PQisBusy(conn_)) {
+                    PGresult *res = PQgetResult(conn_);
+                    if (!res) break;
                     saw_any = true;
                     const auto st = PQresultStatus(res);
 
