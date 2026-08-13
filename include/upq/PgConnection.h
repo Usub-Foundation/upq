@@ -868,7 +868,27 @@ namespace usub::pg {
 
         void close();
 
+        // True when the last socket await was woken by the IO watchdog
+        // instead of data; the connection is unusable from that point on.
+        [[nodiscard]] bool io_timed_out() const noexcept { return io_timed_out_; }
+
     private:
+        // Every query-path socket await is bounded by this deadline so a
+        // lost wakeup (edge-triggered race, peer vanishing without FIN, ...)
+        // surfaces as an error instead of a forever-suspended coroutine.
+        static constexpr uint64_t kIoDeadlineMs = 15000;
+        // Where the deadline is parked between awaits. Doubles as an idle
+        // reaper: a pooled connection untouched this long is marked dead and
+        // dropped on the next acquire instead of being reused blindly.
+        static constexpr uint64_t kIoIdleHorizonMs = 15ull * 60 * 1000;
+        // LISTEN sockets park legitimately for a long time; their horizon is
+        // a day so an abandoned listener still gets reaped eventually.
+        static constexpr uint64_t kListenerHorizonMs = 24ull * 60 * 60 * 1000;
+
+        void arm_io_deadline();
+
+        void settle_io_deadline();
+
         usub::uvent::task::Awaitable<void> wait_readable();
 
         usub::uvent::task::Awaitable<void> wait_writable();
@@ -888,6 +908,7 @@ namespace usub::pg {
     private:
         PGconn *conn_{nullptr};
         bool connected_{false};
+        bool io_timed_out_{false};
 
         std::unique_ptr<
             usub::uvent::net::Socket<
@@ -977,6 +998,11 @@ namespace usub::pg {
                 co_return out;
             }
             co_await wait_writable();
+            if (io_timed_out_) {
+                out.code = PgErrorCode::SocketReadFailed;
+                out.error = "io deadline exceeded";
+                co_return out;
+            }
         }
 
         for (;;) {
@@ -1060,6 +1086,11 @@ namespace usub::pg {
             }
 
             co_await wait_readable();
+            if (io_timed_out_) {
+                out.code = PgErrorCode::SocketReadFailed;
+                out.error = "io deadline exceeded";
+                co_return out;
+            }
         }
     }
 
