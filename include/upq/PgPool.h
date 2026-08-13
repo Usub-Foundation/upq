@@ -58,10 +58,14 @@ namespace usub::pg {
     //  - 08P01: pgbouncer pooler errors ("server login has been failing",
     //    "query_wait_timeout", "cannot connect to server", ...) — the pooler
     //    could not hand the statement to any server connection;
+    //  - 28P01: invalid_password relayed by the pooler when its server-side
+    //    login fails (e.g. SCRAM pass-through keys went stale after the
+    //    password verifier was re-salted); auth happens before any statement,
+    //    and a fresh connection re-reads the current verifier;
     //  - 53300: too_many_connections, 57P03: cannot_connect_now — the server
     //    rejected the session before any statement ran.
     inline bool is_transient_pooler_sqlstate(std::string_view s) {
-        return s == "08P01" || s == "53300" || s == "57P03";
+        return s == "08P01" || s == "28P01" || s == "53300" || s == "57P03";
     }
 
     inline bool is_transient_pooler_error(const PgErrorDetail &d) {
