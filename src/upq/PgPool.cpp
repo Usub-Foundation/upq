@@ -253,6 +253,26 @@ namespace usub::pg {
         co_return;
     }
 
+    usub::uvent::task::Awaitable<void>
+    PgPool::transient_backoff(int attempt, const char *sqlstate) {
+        stats_.transient_retries.fetch_add(1, std::memory_order_relaxed);
+
+        unsigned delay_ms = transient_retry_base_ms_;
+        for (int i = 0; i < attempt; ++i)
+            delay_ms *= 3;
+
+        std::fprintf(stderr,
+                     "[UPQ/pool] transient backend error (sqlstate %s) db=%s user=%s, "
+                     "retry %d/%d in %ums\n",
+                     sqlstate && *sqlstate ? sqlstate : "?",
+                     db_.c_str(), user_.c_str(),
+                     attempt + 1, transient_retry_attempts_ - 1, delay_ms);
+
+        co_await uvent::system::this_coroutine::sleep_for(
+            std::chrono::milliseconds(delay_ms));
+        co_return;
+    }
+
     void PgPool::mark_dead(std::shared_ptr<PgConnectionLibpq> const &conn) {
         if (!conn)
             return;

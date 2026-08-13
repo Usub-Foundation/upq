@@ -171,7 +171,17 @@ namespace usub::pg {
     }
 
     bool PgConnectionLibpq::connected() const noexcept {
-        return connected_ && conn_ && (PQstatus(conn_) == CONNECTION_OK);
+        if (!(connected_ && conn_ && (PQstatus(conn_) == CONNECTION_OK)))
+            return false;
+        // The IO watchdog may fire while the connection sits idle in the
+        // pool (no awaiter to observe it): the header is then marked TIMEOUT
+        // and detached from the poller, so the connection must be dropped.
+        if (io_timed_out_)
+            return false;
+        if (sock_ && (sock_->get_raw_header()->socket_info &
+                      static_cast<uint8_t>(usub::uvent::net::AdditionalState::TIMEOUT)))
+            return false;
+        return true;
     }
 
     usub::uvent::task::Awaitable<bool> PgConnectionLibpq::flush_outgoing() {
@@ -183,6 +193,7 @@ namespace usub::pg {
                 co_return false;
             }
             co_await wait_writable();
+            if (io_timed_out_) co_return false;
         }
     }
 
@@ -202,21 +213,55 @@ namespace usub::pg {
             }
 
             co_await wait_readable();
+            if (io_timed_out_) co_return false;
         }
     }
 
+    void PgConnectionLibpq::arm_io_deadline() {
+        if (sock_)
+            sock_->set_timeout_ms(kIoDeadlineMs);
+    }
+
+    void PgConnectionLibpq::settle_io_deadline() {
+        if (!sock_)
+            return;
+
+        auto *header = sock_->get_raw_header();
+        if (header->socket_info &
+            static_cast<uint8_t>(usub::uvent::net::AdditionalState::TIMEOUT)) {
+            // Woken by the watchdog, not by data: the header is already
+            // detached from the poller, so this connection must not be
+            // awaited again.
+            io_timed_out_ = true;
+            connected_ = false;
+            return;
+        }
+
+        // Park the deadline at the idle horizon so it does not fire mid-pool;
+        // the next await re-arms it tight again.
+        sock_->update_timeout(kIoIdleHorizonMs);
+    }
+
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable() {
+        arm_io_deadline();
         co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
+        settle_io_deadline();
         co_return;
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_writable() {
+        arm_io_deadline();
         co_await usub::uvent::net::detail::AwaiterWrite{sock_->get_raw_header()};
+        settle_io_deadline();
         co_return;
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable_for_listener() {
-        co_await wait_readable();
+        // LISTEN sockets legitimately park for hours: no watchdog here. If a
+        // previous query-path await armed the timer, push it out of the way.
+        if (sock_ && sock_->get_raw_header()->timer_id != 0)
+            sock_->update_timeout(kListenerHorizonMs);
+        co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
         co_return;
     }
 
@@ -497,6 +542,12 @@ namespace usub::pg {
                 }
                 if (sock_) sock_->get_raw_header()->disarm_read();
                 co_await wait_readable();
+                if (io_timed_out_) {
+                    out.ok = false;
+                    out.err.code = PgErrorCode::SocketReadFailed;
+                    out.err.message = "io deadline exceeded";
+                    co_return out;
+                }
                 if (PQconsumeInput(conn_) == 0) {
                     out.ok = false;
                     out.err.code = PgErrorCode::SocketReadFailed;

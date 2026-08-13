@@ -30,6 +30,7 @@ namespace usub::pg {
         std::atomic<uint64_t> checked{0};
         std::atomic<uint64_t> alive{0};
         std::atomic<uint64_t> reconnected{0};
+        std::atomic<uint64_t> transient_retries{0};
     };
 
     inline bool is_fatal_connection_error(const QueryResult &qr) {
@@ -50,6 +51,29 @@ namespace usub::pg {
         }
 
         return false;
+    }
+
+    // Errors for which the statement provably never started executing on a
+    // backend, so a retry on a fresh connection is safe even for writes:
+    //  - 08P01: pgbouncer pooler errors ("server login has been failing",
+    //    "query_wait_timeout", "cannot connect to server", ...) — the pooler
+    //    could not hand the statement to any server connection;
+    //  - 28P01: invalid_password relayed by the pooler when its server-side
+    //    login fails (e.g. SCRAM pass-through keys went stale after the
+    //    password verifier was re-salted); auth happens before any statement,
+    //    and a fresh connection re-reads the current verifier;
+    //  - 53300: too_many_connections, 57P03: cannot_connect_now — the server
+    //    rejected the session before any statement ran.
+    inline bool is_transient_pooler_sqlstate(std::string_view s) {
+        return s == "08P01" || s == "28P01" || s == "53300" || s == "57P03";
+    }
+
+    inline bool is_transient_pooler_error(const PgErrorDetail &d) {
+        return is_transient_pooler_sqlstate(d.sqlstate);
+    }
+
+    inline bool is_transient_pooler_error(const QueryResult &qr) {
+        return !qr.ok && is_transient_pooler_sqlstate(qr.err_detail.sqlstate);
     }
 
     class PgPool {
@@ -149,37 +173,53 @@ namespace usub::pg {
         template<class T>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(std::string sql) {
-            auto c = co_await acquire_connection();
-            if (!c)
-                co_return std::unexpected(c.error());
+            for (int attempt = 0;; ++attempt) {
+                auto c = co_await acquire_connection();
+                if (!c)
+                    co_return std::unexpected(c.error());
 
-            auto conn = *c;
-            auto res = co_await query_on_reflect_expected<T>(conn, std::move(sql));
+                auto conn = *c;
+                auto res = co_await query_on_reflect_expected<T>(conn, sql);
 
-            if (!res)
-                mark_dead(conn);
-            else
-                co_await release_connection_async(conn);
+                if (!res) {
+                    mark_dead(conn);
+                    if (is_transient_pooler_error(res.error().err_detail) &&
+                        attempt + 1 < transient_retry_attempts_) {
+                        co_await transient_backoff(attempt, res.error().err_detail.sqlstate.c_str());
+                        continue;
+                    }
+                } else {
+                    co_await release_connection_async(conn);
+                }
 
-            co_return res;
+                co_return res;
+            }
         }
 
         template<class T>
         usub::uvent::task::Awaitable<std::expected<T, PgOpError> >
         query_reflect_expected_one(std::string sql) {
-            auto c = co_await acquire_connection();
-            if (!c)
-                co_return std::unexpected(c.error());
+            for (int attempt = 0;; ++attempt) {
+                auto c = co_await acquire_connection();
+                if (!c)
+                    co_return std::unexpected(c.error());
 
-            auto conn = *c;
-            auto res = co_await query_on_reflect_expected_one<T>(conn, std::move(sql));
+                auto conn = *c;
+                auto res = co_await query_on_reflect_expected_one<T>(conn, sql);
 
-            if (!res)
-                mark_dead(conn);
-            else
-                co_await release_connection_async(conn);
+                if (!res) {
+                    mark_dead(conn);
+                    if (is_transient_pooler_error(res.error().err_detail) &&
+                        attempt + 1 < transient_retry_attempts_) {
+                        co_await transient_backoff(attempt, res.error().err_detail.sqlstate.c_str());
+                        continue;
+                    }
+                } else {
+                    co_await release_connection_async(conn);
+                }
 
-            co_return res;
+                co_return res;
+            }
         }
 
         template<class T, typename... Args>
@@ -247,39 +287,55 @@ namespace usub::pg {
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(std::string sql, Args &&... args) {
-            auto c = co_await acquire_connection();
-            if (!c)
-                co_return std::unexpected(c.error());
+            for (int attempt = 0;; ++attempt) {
+                auto c = co_await acquire_connection();
+                if (!c)
+                    co_return std::unexpected(c.error());
 
-            auto conn = *c;
-            auto res = co_await query_on_reflect_expected<T>(
-                conn, std::move(sql), std::forward<Args>(args)...);
+                auto conn = *c;
+                // args are passed as lvalues: a retry must not observe
+                // moved-from arguments.
+                auto res = co_await query_on_reflect_expected<T>(conn, sql, args...);
 
-            if (!res)
-                mark_dead(conn);
-            else
-                co_await release_connection_async(conn);
+                if (!res) {
+                    mark_dead(conn);
+                    if (is_transient_pooler_error(res.error().err_detail) &&
+                        attempt + 1 < transient_retry_attempts_) {
+                        co_await transient_backoff(attempt, res.error().err_detail.sqlstate.c_str());
+                        continue;
+                    }
+                } else {
+                    co_await release_connection_async(conn);
+                }
 
-            co_return res;
+                co_return res;
+            }
         }
 
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<T, PgOpError> >
         query_reflect_expected_one(std::string sql, Args &&... args) {
-            auto c = co_await acquire_connection();
-            if (!c)
-                co_return std::unexpected(c.error());
+            for (int attempt = 0;; ++attempt) {
+                auto c = co_await acquire_connection();
+                if (!c)
+                    co_return std::unexpected(c.error());
 
-            auto conn = *c;
-            auto res = co_await query_on_reflect_expected_one<T>(
-                conn, std::move(sql), std::forward<Args>(args)...);
+                auto conn = *c;
+                auto res = co_await query_on_reflect_expected_one<T>(conn, sql, args...);
 
-            if (!res)
-                mark_dead(conn);
-            else
-                co_await release_connection_async(conn);
+                if (!res) {
+                    mark_dead(conn);
+                    if (is_transient_pooler_error(res.error().err_detail) &&
+                        attempt + 1 < transient_retry_attempts_) {
+                        co_await transient_backoff(attempt, res.error().err_detail.sqlstate.c_str());
+                        continue;
+                    }
+                } else {
+                    co_await release_connection_async(conn);
+                }
 
-            co_return res;
+                co_return res;
+            }
         }
 
         template<class Obj>
@@ -658,6 +714,23 @@ namespace usub::pg {
 
         inline HealthStats &health_stats() { return stats_; }
 
+        // Transient-error retry policy: how many total tries a pool-level
+        // query (or an emulated-readonly transaction query / BEGIN) makes
+        // when it hits a transient pooler error (see
+        // is_transient_pooler_error). attempts <= 1 disables retries.
+        // Delay before retry i (0-based) is base_ms * 3^i.
+        inline void set_transient_retry(int attempts, unsigned base_ms) {
+            transient_retry_attempts_ = attempts > 0 ? attempts : 1;
+            transient_retry_base_ms_ = base_ms;
+        }
+
+        inline int transient_retry_attempts() const { return transient_retry_attempts_; }
+
+        // Logs the retry, bumps stats and sleeps the backoff delay for the
+        // given 0-based attempt number. Shared by PgPool and PgTransaction.
+        usub::uvent::task::Awaitable<void>
+        transient_backoff(int attempt, const char *sqlstate);
+
     private:
         std::string host_;
         std::string port_;
@@ -672,6 +745,8 @@ namespace usub::pg {
 
         HealthStats stats_;
         int retries_on_connection_failed_;
+        int transient_retry_attempts_{3};
+        unsigned transient_retry_base_ms_{200};
 
         usub::uvent::sync::AsyncSemaphore idle_sem_{0};
         SSLConfig ssl_config_;
@@ -707,33 +782,37 @@ namespace usub::pg {
     template<typename... Args>
     usub::uvent::task::Awaitable<QueryResult>
     PgPool::query_awaitable(std::string sql, Args &&... args) {
-        auto c = co_await acquire_connection();
-        if (!c) {
-            const auto &e = c.error();
-            QueryResult bad;
-            bad.ok = false;
-            bad.code = e.code;
-            bad.error = e.error;
-            bad.err_detail = e.err_detail;
-            bad.rows_valid = false;
-            co_return bad;
+        for (int attempt = 0;; ++attempt) {
+            auto c = co_await acquire_connection();
+            if (!c) {
+                const auto &e = c.error();
+                QueryResult bad;
+                bad.ok = false;
+                bad.code = e.code;
+                bad.error = e.error;
+                bad.err_detail = e.err_detail;
+                bad.rows_valid = false;
+                co_return bad;
+            }
+
+            auto conn = *c;
+
+            QueryResult qr = co_await query_on(conn, sql, args...);
+
+            if (is_transient_pooler_error(qr)) {
+                mark_dead(conn);
+                if (attempt + 1 < transient_retry_attempts_) {
+                    co_await transient_backoff(attempt, qr.err_detail.sqlstate.c_str());
+                    continue;
+                }
+            } else if (is_fatal_connection_error(qr)) {
+                mark_dead(conn);
+            } else {
+                co_await release_connection_async(conn);
+            }
+
+            co_return qr;
         }
-
-        auto conn = *c;
-
-        QueryResult qr = co_await query_on(
-            conn,
-            std::move(sql),
-            std::forward<Args>(args)...
-        );
-
-        if (is_fatal_connection_error(qr)) {
-            mark_dead(conn);
-        } else {
-            co_await release_connection_async(conn);
-        }
-
-        co_return qr;
     }
 
     template<class T>
@@ -857,28 +936,36 @@ namespace usub::pg {
     template<class Obj>
     usub::uvent::task::Awaitable<QueryResult>
     PgPool::exec_reflect(std::string sql, const Obj &obj) {
-        auto c = co_await acquire_connection();
-        if (!c) {
-            const auto &e = c.error();
-            QueryResult bad;
-            bad.ok = false;
-            bad.code = e.code;
-            bad.error = e.error;
-            bad.err_detail = e.err_detail;
-            bad.rows_valid = false;
-            co_return bad;
+        for (int attempt = 0;; ++attempt) {
+            auto c = co_await acquire_connection();
+            if (!c) {
+                const auto &e = c.error();
+                QueryResult bad;
+                bad.ok = false;
+                bad.code = e.code;
+                bad.error = e.error;
+                bad.err_detail = e.err_detail;
+                bad.rows_valid = false;
+                co_return bad;
+            }
+
+            auto conn = *c;
+            auto qr = co_await exec_reflect_on(conn, sql, obj);
+
+            if (is_transient_pooler_error(qr)) {
+                mark_dead(conn);
+                if (attempt + 1 < transient_retry_attempts_) {
+                    co_await transient_backoff(attempt, qr.err_detail.sqlstate.c_str());
+                    continue;
+                }
+            } else if (is_fatal_connection_error(qr)) {
+                mark_dead(conn);
+            } else {
+                co_await release_connection_async(conn);
+            }
+
+            co_return qr;
         }
-
-        auto conn = *c;
-        auto qr = co_await exec_reflect_on(conn, std::move(sql), obj);
-
-        if (is_fatal_connection_error(qr)) {
-            mark_dead(conn);
-        } else {
-            co_await release_connection_async(conn);
-        }
-
-        co_return qr;
     }
 } // namespace usub::pg
 

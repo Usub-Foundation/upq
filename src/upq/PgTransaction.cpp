@@ -76,58 +76,71 @@ namespace usub::pg
             co_return std::nullopt;
         }
 
-        auto c = co_await pool_->acquire_connection();
-        if (!c)
+        for (int attempt = 0;; ++attempt)
         {
-            conn_.reset();
-            PgOpError err{
-                PgErrorCode::ConnectionClosed,
-                "failed to acquire connection from pool",
-                {}
-            };
-            co_return std::make_optional(std::move(err));
-        }
+            auto c = co_await pool_->acquire_connection();
+            if (!c)
+            {
+                conn_.reset();
+                PgOpError err{
+                    PgErrorCode::ConnectionClosed,
+                    "failed to acquire connection from pool",
+                    {}
+                };
+                co_return std::make_optional(std::move(err));
+            }
 
-        conn_ = *c;
-        if (!conn_ || !conn_->connected())
-        {
-            PgOpError err{
-                PgErrorCode::ConnectionClosed,
-                "connection not OK",
-                {}
-            };
-            if (conn_)
+            conn_ = *c;
+            if (!conn_ || !conn_->connected())
+            {
+                PgOpError err{
+                    PgErrorCode::ConnectionClosed,
+                    "connection not OK",
+                    {}
+                };
+                if (conn_)
+                    pool_->mark_dead(conn_);
+                conn_.reset();
+                co_return std::make_optional(std::move(err));
+            }
+
+            if (emulate_readonly_autocommit_)
+            {
+                active_ = true;
+                committed_ = false;
+                rolled_back_ = false;
+                co_return std::nullopt;
+            }
+
+            const std::string bsql = build_begin_sql(cfg_);
+            QueryResult r_begin = co_await pool_->query_on(conn_, bsql);
+            if (!r_begin.ok)
+            {
+                PgOpError err{r_begin.code, r_begin.error, r_begin.err_detail};
                 pool_->mark_dead(conn_);
-            conn_.reset();
-            co_return std::make_optional(std::move(err));
-        }
+                conn_.reset();
 
-        if (emulate_readonly_autocommit_)
-        {
+                // BEGIN never reached a backend (pooler could not hand out a
+                // server connection) — safe to retry on a fresh connection.
+                if (is_transient_pooler_error(r_begin) &&
+                    attempt + 1 < pool_->transient_retry_attempts())
+                {
+                    co_await pool_->transient_backoff(
+                        attempt, r_begin.err_detail.sqlstate.c_str());
+                    continue;
+                }
+
+                active_ = false;
+                committed_ = false;
+                rolled_back_ = false;
+                co_return std::make_optional(std::move(err));
+            }
+
             active_ = true;
             committed_ = false;
             rolled_back_ = false;
             co_return std::nullopt;
         }
-
-        const std::string bsql = build_begin_sql(cfg_);
-        QueryResult r_begin = co_await pool_->query_on(conn_, bsql);
-        if (!r_begin.ok)
-        {
-            PgOpError err{r_begin.code, r_begin.error, r_begin.err_detail};
-            pool_->mark_dead(conn_);
-            conn_.reset();
-
-            active_ = false;
-            committed_ = false;
-            rolled_back_ = false;
-            co_return std::make_optional(std::move(err));
-        }
-
-        active_ = true;
-        committed_ = false;
-        rolled_back_ = false;
-        co_return std::nullopt;
     }
 
     usub::uvent::task::Awaitable<bool> PgTransaction::commit()
@@ -274,6 +287,30 @@ namespace usub::pg
             conn_.reset();
         }
         co_return;
+    }
+
+    usub::uvent::task::Awaitable<bool>
+    PgTransaction::reacquire_for_transient_retry(int attempt, const char* sqlstate)
+    {
+        if (conn_)
+            pool_->mark_dead(conn_);
+        conn_.reset();
+
+        co_await pool_->transient_backoff(attempt, sqlstate);
+
+        auto c = co_await pool_->acquire_connection();
+        if (!c || !*c || !(*c)->connected())
+        {
+            if (c && *c)
+                pool_->mark_dead(*c);
+            active_ = false;
+            committed_ = false;
+            rolled_back_ = true;
+            co_return false;
+        }
+
+        conn_ = *c;
+        co_return true;
     }
 
     usub::uvent::task::Awaitable<bool> PgTransaction::send_sql_nocheck(const std::string& sql)
