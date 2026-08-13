@@ -87,206 +87,254 @@ namespace usub::pg {
         template<class T>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(std::string sql) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(conn_, std::move(sql));
+                QueryResult qr = co_await pool_->query_on(conn_, sql);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto vec = usub::pg::map_all_reflect_named<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
-            } catch (const std::exception &) {
-                auto vec = usub::pg::map_all_reflect_positional<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+
+                try {
+                    auto vec = usub::pg::map_all_reflect_named<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                } catch (const std::exception &) {
+                    auto vec = usub::pg::map_all_reflect_positional<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                }
             }
         }
 
         template<class T>
         usub::uvent::task::Awaitable<std::expected<T, PgOpError> >
         query_reflect_expected_one(std::string sql) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(conn_, std::move(sql));
+                QueryResult qr = co_await pool_->query_on(conn_, sql);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            if (qr.rows.empty())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::Unknown, "no rows", {}}
-                );
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
-            } catch (const std::exception &) {
-                auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (qr.rows.empty())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::Unknown, "no rows", {}}
+                    );
+
+                try {
+                    auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                } catch (const std::exception &) {
+                    auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                }
             }
         }
 
         template<class T, class Obj>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(std::string sql, const Obj &obj) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(conn_, std::move(sql), obj);
+                QueryResult qr = co_await pool_->query_on(conn_, sql, obj);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto vec = usub::pg::map_all_reflect_named<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
-            } catch (const std::exception &) {
-                auto vec = usub::pg::map_all_reflect_positional<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+
+                try {
+                    auto vec = usub::pg::map_all_reflect_named<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                } catch (const std::exception &) {
+                    auto vec = usub::pg::map_all_reflect_positional<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                }
             }
         }
 
         template<class T, class Obj>
         usub::uvent::task::Awaitable<std::expected<T, PgOpError> >
         query_reflect_expected_one(std::string sql, const Obj &obj) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(conn_, std::move(sql), obj);
+                QueryResult qr = co_await pool_->query_on(conn_, sql, obj);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            if (qr.rows.empty())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::Unknown, "no rows", {}}
-                );
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
-            } catch (const std::exception &) {
-                auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (qr.rows.empty())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::Unknown, "no rows", {}}
+                    );
+
+                try {
+                    auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                } catch (const std::exception &) {
+                    auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                }
             }
         }
 
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(std::string sql, Args &&... args) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(
-                conn_,
-                std::move(sql),
-                std::forward<Args>(args)...
-            );
+                // sql and args are passed as lvalues: a retry must not
+                // observe moved-from values.
+                QueryResult qr = co_await pool_->query_on(conn_, sql, args...);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto vec = usub::pg::map_all_reflect_named<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
-            } catch (const std::exception &) {
-                auto vec = usub::pg::map_all_reflect_positional<T>(qr);
-                co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+
+                try {
+                    auto vec = usub::pg::map_all_reflect_named<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                } catch (const std::exception &) {
+                    auto vec = usub::pg::map_all_reflect_positional<T>(qr);
+                    co_return std::expected<std::vector<T>, PgOpError>{std::in_place, std::move(vec)};
+                }
             }
         }
 
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<T, PgOpError> >
         query_reflect_expected_one(std::string sql, Args &&... args) {
-            if (!active_ || !conn_ || !conn_->connected())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
-                );
+            for (int attempt = 0;; ++attempt) {
+                if (!active_ || !conn_ || !conn_->connected())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::InvalidFuture, "transaction not active", {}}
+                    );
 
-            QueryResult qr = co_await pool_->query_on(
-                conn_,
-                std::move(sql),
-                std::forward<Args>(args)...
-            );
+                QueryResult qr = co_await pool_->query_on(conn_, sql, args...);
 
-            if (is_fatal_connection_error(qr)) {
-                pool_->mark_dead(conn_);
-                conn_.reset();
-                active_ = false;
-                rolled_back_ = true;
-                committed_ = false;
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            }
+                if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                    attempt + 1 < pool_->transient_retry_attempts()) {
+                    if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                        continue;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            if (!qr.ok)
-                co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
-            if (qr.rows.empty())
-                co_return std::unexpected(
-                    PgOpError{PgErrorCode::Unknown, "no rows", {}}
-                );
+                if (is_fatal_connection_error(qr)) {
+                    pool_->mark_dead(conn_);
+                    conn_.reset();
+                    active_ = false;
+                    rolled_back_ = true;
+                    committed_ = false;
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                }
 
-            try {
-                auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
-            } catch (const std::exception &) {
-                auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
-                co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                if (!qr.ok)
+                    co_return std::unexpected(PgOpError{qr.code, qr.error, qr.err_detail});
+                if (qr.rows.empty())
+                    co_return std::unexpected(
+                        PgOpError{PgErrorCode::Unknown, "no rows", {}}
+                    );
+
+                try {
+                    auto v = usub::pg::map_single_reflect_named<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                } catch (const std::exception &) {
+                    auto v = usub::pg::map_single_reflect_positional<T>(qr, 0);
+                    co_return std::expected<T, PgOpError>{std::in_place, std::move(v)};
+                }
             }
         }
 
@@ -738,6 +786,13 @@ namespace usub::pg {
 
         bool emulate_readonly_autocommit_{false};
 
+        // Replaces conn_ with a fresh pool connection after a transient
+        // pooler error (emulated-readonly mode only, where every statement
+        // is independent). Returns false and deactivates the transaction if
+        // no connection could be acquired.
+        usub::uvent::task::Awaitable<bool>
+        reacquire_for_transient_retry(int attempt, const char *sqlstate);
+
         usub::uvent::task::Awaitable<bool> send_sql_nocheck(const std::string &sql);
 
         static std::string build_begin_sql(const PgTransactionConfig &cfg);
@@ -746,44 +801,49 @@ namespace usub::pg {
     template<typename... Args>
     usub::uvent::task::Awaitable<QueryResult>
     PgTransaction::query(std::string sql, Args &&... args) {
-        if (!active_ || !conn_) {
-            QueryResult bad;
-            bad.ok = false;
-            bad.code = PgErrorCode::InvalidFuture;
-            bad.error = "transaction not active";
-            bad.rows_valid = false;
-            co_return bad;
+        for (int attempt = 0;; ++attempt) {
+            if (!active_ || !conn_) {
+                QueryResult bad;
+                bad.ok = false;
+                bad.code = PgErrorCode::InvalidFuture;
+                bad.error = "transaction not active";
+                bad.rows_valid = false;
+                co_return bad;
+            }
+
+            if (!conn_->connected()) {
+                QueryResult bad;
+                bad.ok = false;
+                bad.code = PgErrorCode::ConnectionClosed;
+                bad.error = "connection lost in transaction";
+                bad.rows_valid = false;
+                active_ = false;
+                rolled_back_ = true;
+                committed_ = false;
+
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                co_return bad;
+            }
+
+            QueryResult qr = co_await pool_->query_on(conn_, sql, args...);
+
+            if (emulate_readonly_autocommit_ && is_transient_pooler_error(qr) &&
+                attempt + 1 < pool_->transient_retry_attempts()) {
+                if (co_await reacquire_for_transient_retry(attempt, qr.err_detail.sqlstate.c_str()))
+                    continue;
+                co_return qr;
+            }
+
+            if (is_fatal_connection_error(qr)) {
+                pool_->mark_dead(conn_);
+                conn_.reset();
+                active_ = false;
+                rolled_back_ = true;
+                committed_ = false;
+            }
+            co_return qr;
         }
-
-        if (!conn_->connected()) {
-            QueryResult bad;
-            bad.ok = false;
-            bad.code = PgErrorCode::ConnectionClosed;
-            bad.error = "connection lost in transaction";
-            bad.rows_valid = false;
-            active_ = false;
-            rolled_back_ = true;
-            committed_ = false;
-
-            pool_->mark_dead(conn_);
-            conn_.reset();
-            co_return bad;
-        }
-
-        QueryResult qr = co_await pool_->query_on(
-            conn_,
-            std::move(sql),
-            std::forward<Args>(args)...
-        );
-
-        if (is_fatal_connection_error(qr)) {
-            pool_->mark_dead(conn_);
-            conn_.reset();
-            active_ = false;
-            rolled_back_ = true;
-            committed_ = false;
-        }
-        co_return qr;
     }
 } // namespace usub::pg
 
