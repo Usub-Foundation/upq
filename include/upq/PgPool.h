@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <expected>
 #include <cstdio>
@@ -31,6 +32,8 @@ namespace usub::pg {
         std::atomic<uint64_t> alive{0};
         std::atomic<uint64_t> reconnected{0};
         std::atomic<uint64_t> transient_retries{0};
+        // Awaits cut short by io_watchdog_loop() (see PgConnectionLibpq::kIoDeadlineMs).
+        std::atomic<uint64_t> io_watchdog_aborts{0};
     };
 
     inline bool is_fatal_connection_error(const QueryResult &qr) {
@@ -95,6 +98,14 @@ namespace usub::pg {
         acquire_connection();
 
         void release_connection(std::shared_ptr<PgConnectionLibpq> conn);
+
+        // IO watchdog: one coroutine per pool that every second walks the
+        // pool's connections and cuts awaits parked longer than
+        // PgConnectionLibpq::kIoDeadlineMs via ::shutdown(2) (safe from any
+        // worker; the owner poller wakes the coroutine with HUP). Started
+        // lazily by the first acquire_connection(); calling it yourself is
+        // harmless (a second instance is a no-op).
+        usub::uvent::task::Awaitable<void> io_watchdog_loop();
 
         usub::uvent::task::Awaitable<void>
         release_connection_async(std::shared_ptr<PgConnectionLibpq> conn);
@@ -751,6 +762,19 @@ namespace usub::pg {
         usub::uvent::sync::AsyncSemaphore idle_sem_{0};
         SSLConfig ssl_config_;
         TCPKeepaliveConfig keepalive_config_;
+
+        // Every connection ever created by this pool (weak: lifetime stays
+        // with the shared_ptr holders), for the IO watchdog to scan. Pruned of
+        // expired entries on each watchdog pass. Guarded by conns_mtx_ because
+        // acquire_connection() runs on any worker.
+        std::mutex conns_mtx_;
+        std::vector<std::weak_ptr<PgConnectionLibpq> > conns_;
+        std::atomic<bool> watchdog_started_{false};
+        std::atomic<bool> closing_{false};
+
+        void register_connection(const std::shared_ptr<PgConnectionLibpq> &conn);
+
+        void ensure_watchdog_started();
     };
 
     template<typename... Args>
