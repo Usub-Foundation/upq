@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <sys/socket.h>
+
 namespace usub::pg {
     static void fill_server_error_fields_copy(PGresult *res, PgCopyResult &out) {
         if (!res) return;
@@ -173,11 +175,11 @@ namespace usub::pg {
     bool PgConnectionLibpq::connected() const noexcept {
         if (!(connected_ && conn_ && (PQstatus(conn_) == CONNECTION_OK)))
             return false;
-        // The IO watchdog may fire while the connection sits idle in the
-        // pool (no awaiter to observe it): the header is then marked TIMEOUT
-        // and detached from the poller, so the connection must be dropped.
-        if (io_timed_out_)
+        // Cut short by the pool watchdog: the socket is shut down, drop it.
+        if (io_timed_out())
             return false;
+        // Defensive: if anything else armed the socket timer and it fired,
+        // the header is detached from the poller and must not be awaited.
         if (sock_ && (sock_->get_raw_header()->socket_info &
                       static_cast<uint8_t>(usub::uvent::net::AdditionalState::TIMEOUT)))
             return false;
@@ -193,7 +195,7 @@ namespace usub::pg {
                 co_return false;
             }
             co_await wait_writable();
-            if (io_timed_out_) co_return false;
+            if (io_timed_out()) co_return false;
         }
     }
 
@@ -213,54 +215,77 @@ namespace usub::pg {
             }
 
             co_await wait_readable();
-            if (io_timed_out_) co_return false;
+            if (io_timed_out()) co_return false;
         }
     }
 
-    void PgConnectionLibpq::arm_io_deadline() {
-        if (sock_)
-            sock_->set_timeout_ms(kIoDeadlineMs);
+    uint64_t PgConnectionLibpq::steady_now_ms() noexcept {
+        using namespace std::chrono;
+        return static_cast<uint64_t>(
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
     }
 
-    void PgConnectionLibpq::settle_io_deadline() {
-        if (!sock_)
-            return;
+    void PgConnectionLibpq::mark_await_begin() noexcept {
+        // Publish "an await is parked since now" for the pool watchdog. No
+        // socket timer is touched: see the note next to kIoDeadlineMs.
+        await_since_ms_.store(steady_now_ms(), std::memory_order_release);
+    }
 
-        auto *header = sock_->get_raw_header();
-        if (header->socket_info &
-            static_cast<uint8_t>(usub::uvent::net::AdditionalState::TIMEOUT)) {
-            // Woken by the watchdog, not by data: the header is already
-            // detached from the poller, so this connection must not be
-            // awaited again.
-            io_timed_out_ = true;
+    void PgConnectionLibpq::mark_await_end() noexcept {
+        await_since_ms_.store(0, std::memory_order_release);
+        // Woken by the watchdog's shutdown(2), not by data: the socket is
+        // half-dead, this connection must not be reused.
+        if (io_timed_out())
             connected_ = false;
-            return;
-        }
+    }
 
-        // Park the deadline at the idle horizon so it does not fire mid-pool;
-        // the next await re-arms it tight again.
-        sock_->update_timeout(kIoIdleHorizonMs);
+    const char *PgConnectionLibpq::io_error_message() const noexcept {
+        if (io_timed_out())
+            return "io deadline exceeded";
+        const char *m = conn_ ? PQerrorMessage(conn_) : nullptr;
+        return m ? m : "";
+    }
+
+    bool PgConnectionLibpq::abort_io_from_watchdog() noexcept {
+        // Serialised with close(): PQfinish() closes the fd, and a shutdown(2)
+        // on an fd number that the kernel has already handed to somebody else
+        // would hit a stranger's socket. Under the lock conn_ is either alive
+        // (fd valid) or null.
+        std::lock_guard<std::mutex> lk(close_mtx_);
+        if (!conn_)
+            return false;
+        // The await may have completed between the watchdog's read of
+        // io_await_since_ms() and now; only a still-parked await is cut.
+        if (await_since_ms_.load(std::memory_order_acquire) == 0)
+            return false;
+        io_timed_out_.store(true, std::memory_order_release);
+        const int fd = PQsocket(conn_);
+        if (fd < 0)
+            return false;
+        // Wakes the parked coroutine through the owner worker's poller
+        // (EPOLLIN|EPOLLHUP|EPOLLRDHUP on an edge-triggered registration is a
+        // fresh edge), from whichever thread the watchdog happens to run on.
+        ::shutdown(fd, SHUT_RDWR);
+        return true;
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable() {
-        arm_io_deadline();
+        mark_await_begin();
         co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
-        settle_io_deadline();
+        mark_await_end();
         co_return;
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_writable() {
-        arm_io_deadline();
+        mark_await_begin();
         co_await usub::uvent::net::detail::AwaiterWrite{sock_->get_raw_header()};
-        settle_io_deadline();
+        mark_await_end();
         co_return;
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable_for_listener() {
-        // LISTEN sockets legitimately park for hours: no watchdog here. If a
-        // previous query-path await armed the timer, push it out of the way.
-        if (sock_ && sock_->get_raw_header()->timer_id != 0)
-            sock_->update_timeout(kListenerHorizonMs);
+        // LISTEN sockets legitimately park for hours: no watchdog here, so the
+        // await timestamp is deliberately not published.
         co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
         co_return;
     }
@@ -293,7 +318,7 @@ namespace usub::pg {
         if (!(co_await flush_outgoing())) {
             out.ok = false;
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             out.rows_valid = false;
             connected_ = false;
             co_return out;
@@ -302,7 +327,7 @@ namespace usub::pg {
         if (!(co_await pump_input())) {
             out.ok = false;
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             out.rows_valid = false;
             connected_ = false;
             co_return out;
@@ -332,14 +357,14 @@ namespace usub::pg {
 
         if (!(co_await flush_outgoing())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
 
         if (!(co_await pump_input())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
@@ -388,7 +413,7 @@ namespace usub::pg {
             }
             if (!(co_await flush_outgoing())) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = PQerrorMessage(conn_);
+                out.error = io_error_message();
                 connected_ = false;
                 co_return out;
             }
@@ -428,7 +453,7 @@ namespace usub::pg {
             }
             if (!(co_await flush_outgoing())) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = PQerrorMessage(conn_);
+                out.error = io_error_message();
                 connected_ = false;
                 co_return out;
             }
@@ -436,14 +461,14 @@ namespace usub::pg {
 
         if (!(co_await flush_outgoing())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
 
         if (!(co_await pump_input())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
@@ -473,14 +498,14 @@ namespace usub::pg {
 
         if (!(co_await flush_outgoing())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
 
         if (!(co_await pump_input())) {
             out.code = PgErrorCode::SocketReadFailed;
-            out.error = PQerrorMessage(conn_);
+            out.error = io_error_message();
             connected_ = false;
             co_return out;
         }
@@ -542,7 +567,7 @@ namespace usub::pg {
                 }
                 if (sock_) sock_->get_raw_header()->disarm_read();
                 co_await wait_readable();
-                if (io_timed_out_) {
+                if (io_timed_out()) {
                     out.ok = false;
                     out.err.code = PgErrorCode::SocketReadFailed;
                     out.err.message = "io deadline exceeded";
@@ -674,14 +699,14 @@ namespace usub::pg {
 
         if (!(co_await flush_outgoing())) {
             chunk.code = PgErrorCode::SocketReadFailed;
-            chunk.error = PQerrorMessage(conn_);
+            chunk.error = io_error_message();
             connected_ = false;
             co_return chunk;
         }
 
         if (!(co_await pump_input())) {
             chunk.code = PgErrorCode::SocketReadFailed;
-            chunk.error = PQerrorMessage(conn_);
+            chunk.error = io_error_message();
             connected_ = false;
             co_return chunk;
         }
@@ -691,7 +716,7 @@ namespace usub::pg {
         for (;;) {
             if (!(co_await pump_input())) {
                 chunk.code = PgErrorCode::SocketReadFailed;
-                chunk.error = PQerrorMessage(conn_);
+                chunk.error = io_error_message();
                 connected_ = false;
                 co_return chunk;
             }
@@ -759,7 +784,7 @@ namespace usub::pg {
 
         if (!(co_await flush_outgoing())) {
             final.code = PgErrorCode::SocketReadFailed;
-            final.error = PQerrorMessage(conn_);
+            final.error = io_error_message();
             final.rows_valid = false;
             connected_ = false;
             co_return final;
@@ -767,7 +792,7 @@ namespace usub::pg {
 
         if (!(co_await pump_input())) {
             final.code = PgErrorCode::SocketReadFailed;
-            final.error = PQerrorMessage(conn_);
+            final.error = io_error_message();
             final.rows_valid = false;
             connected_ = false;
             co_return final;

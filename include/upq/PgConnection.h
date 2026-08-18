@@ -868,26 +868,51 @@ namespace usub::pg {
 
         void close();
 
-        // True when the last socket await was woken by the IO watchdog
-        // instead of data; the connection is unusable from that point on.
-        [[nodiscard]] bool io_timed_out() const noexcept { return io_timed_out_; }
+        // True when the last socket await was cut short by the pool's IO
+        // watchdog instead of data; the connection is unusable from then on.
+        [[nodiscard]] bool io_timed_out() const noexcept {
+            return io_timed_out_.load(std::memory_order_acquire);
+        }
 
-    private:
         // Every query-path socket await is bounded by this deadline so a
         // lost wakeup (edge-triggered race, peer vanishing without FIN, ...)
         // surfaces as an error instead of a forever-suspended coroutine.
+        //
+        // The deadline is NOT enforced with the socket's own uvent timer: that
+        // timer lives in the thread_local timer wheel of whichever worker
+        // arms it, while pooled connections migrate between workers, so
+        // arm/update/cancel from another worker silently hit a foreign wheel
+        // and left a dangling Timer* behind (heap corruption once the header
+        // was freed). Instead the connection only publishes the timestamp of
+        // its current await and PgPool::io_watchdog_loop() (one coroutine per
+        // pool) tears down overdue awaits via ::shutdown(2), which is safe from
+        // any thread and wakes the parked coroutine through the owner poller
+        // (EPOLLHUP/EPOLLRDHUP).
         static constexpr uint64_t kIoDeadlineMs = 15000;
-        // Where the deadline is parked between awaits. Doubles as an idle
-        // reaper: a pooled connection untouched this long is marked dead and
-        // dropped on the next acquire instead of being reused blindly.
-        static constexpr uint64_t kIoIdleHorizonMs = 15ull * 60 * 1000;
-        // LISTEN sockets park legitimately for a long time; their horizon is
-        // a day so an abandoned listener still gets reaped eventually.
-        static constexpr uint64_t kListenerHorizonMs = 24ull * 60 * 60 * 1000;
 
-        void arm_io_deadline();
+        // Steady-clock timestamp (ms) of the await currently in flight, 0 when
+        // no query-path await is parked. Read by the pool watchdog.
+        [[nodiscard]] uint64_t io_await_since_ms() const noexcept {
+            return await_since_ms_.load(std::memory_order_acquire);
+        }
 
-        void settle_io_deadline();
+        // Called by the pool watchdog when io_await_since_ms() is overdue:
+        // marks the connection timed out and shuts the socket down so the
+        // parked await wakes up and bails with "io deadline exceeded".
+        // Returns true if a shutdown was issued.
+        bool abort_io_from_watchdog() noexcept;
+
+        static uint64_t steady_now_ms() noexcept;
+
+    private:
+        void mark_await_begin() noexcept;
+
+        void mark_await_end() noexcept;
+
+        // libpq's own message after a failed flush/pump, or the watchdog's
+        // "io deadline exceeded" when the await was cut short (libpq has no
+        // error of its own in that case, so the message would come out empty).
+        [[nodiscard]] const char *io_error_message() const noexcept;
 
         usub::uvent::task::Awaitable<void> wait_readable();
 
@@ -908,7 +933,8 @@ namespace usub::pg {
     private:
         PGconn *conn_{nullptr};
         bool connected_{false};
-        bool io_timed_out_{false};
+        std::atomic<bool> io_timed_out_{false};
+        std::atomic<uint64_t> await_since_ms_{0};
 
         std::unique_ptr<
             usub::uvent::net::Socket<

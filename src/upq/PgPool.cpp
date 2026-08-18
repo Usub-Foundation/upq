@@ -29,7 +29,12 @@ namespace usub::pg {
 #endif
     }
 
-    PgPool::~PgPool() = default;
+    PgPool::~PgPool() {
+        // The watchdog coroutine holds a raw `this`; pools live for the whole
+        // process in practice, but make a stray loop iteration exit instead
+        // of touching a dead pool.
+        closing_.store(true, std::memory_order_release);
+    }
 
     void PgPool::close_all() {
         std::shared_ptr<PgConnectionLibpq> conn;
@@ -41,9 +46,65 @@ namespace usub::pg {
         }
     }
 
+    void PgPool::register_connection(const std::shared_ptr<PgConnectionLibpq> &conn) {
+        std::lock_guard<std::mutex> lk(conns_mtx_);
+        conns_.push_back(conn);
+    }
+
+    void PgPool::ensure_watchdog_started() {
+        if (watchdog_started_.exchange(true, std::memory_order_acq_rel))
+            return;
+        // Member coroutine, no lambda captures (uvent co_spawn + captured
+        // lambdas is a known lifetime trap).
+        usub::uvent::system::co_spawn(this->io_watchdog_loop());
+    }
+
+    usub::uvent::task::Awaitable<void> PgPool::io_watchdog_loop() {
+        using namespace std::chrono_literals;
+
+        std::vector<std::shared_ptr<PgConnectionLibpq> > live;
+        for (;;) {
+            co_await uvent::system::this_coroutine::sleep_for(1000ms);
+            if (closing_.load(std::memory_order_acquire))
+                co_return;
+
+            // Snapshot under the lock, work outside it: abort_io_from_watchdog
+            // takes the connection's close mutex and must not nest under ours.
+            live.clear();
+            {
+                std::lock_guard<std::mutex> lk(conns_mtx_);
+                size_t w = 0;
+                for (size_t r = 0; r < conns_.size(); ++r) {
+                    if (auto sp = conns_[r].lock()) {
+                        live.push_back(std::move(sp));
+                        conns_[w++] = std::move(conns_[r]);
+                    }
+                }
+                conns_.resize(w);
+            }
+
+            const uint64_t now = PgConnectionLibpq::steady_now_ms();
+            for (auto &c : live) {
+                const uint64_t since = c->io_await_since_ms();
+                if (since == 0 || now < since + PgConnectionLibpq::kIoDeadlineMs)
+                    continue;
+                if (c->abort_io_from_watchdog()) {
+                    stats_.io_watchdog_aborts.fetch_add(1, std::memory_order_relaxed);
+#if UPQ_POOL_DEBUG
+                    UPQ_POOL_DBG("io watchdog: conn=%p await parked %llu ms, socket shut down",
+                                 c.get(), static_cast<unsigned long long>(now - since));
+#endif
+                }
+            }
+            live.clear();
+        }
+    }
+
     usub::uvent::task::Awaitable<std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError> >
     PgPool::acquire_connection() {
         using namespace std::chrono_literals;
+
+        ensure_watchdog_started();
 
         std::shared_ptr<PgConnectionLibpq> conn;
 
@@ -123,6 +184,7 @@ namespace usub::pg {
 #endif
 
                     auto newConn = std::make_shared<PgConnectionLibpq>();
+                    register_connection(newConn);
 
                     auto conninfo = make_conninfo(host_, port_, user_, db_, password_, ssl_config_, this->keepalive_config_);
                     if (!conninfo)
