@@ -86,7 +86,7 @@ namespace usub::pg {
             const uint64_t now = PgConnectionLibpq::steady_now_ms();
             for (auto &c : live) {
                 const uint64_t since = c->io_await_since_ms();
-                if (since == 0 || now < since + PgConnectionLibpq::kIoDeadlineMs)
+                if (since == 0 || now < since + c->io_deadline_ms())
                     continue;
                 if (c->abort_io_from_watchdog()) {
                     stats_.io_watchdog_aborts.fetch_add(1, std::memory_order_relaxed);
