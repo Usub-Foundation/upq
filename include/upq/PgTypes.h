@@ -152,6 +152,16 @@ namespace usub::pg {
         PgErrorDetail err_detail;
     };
 
+    // Per-query knobs for pool queries. io_deadline_ms bounds every socket
+    // await of that one query — enforced by the pool's IO watchdog, which
+    // ticks once a second, so the effective resolution is +0..1s and values
+    // under 1000 are not meaningful. 0 = connection default
+    // (PgConnectionLibpq::kIoDeadlineMs). The override is set on the pooled
+    // connection for the duration of the query and restored afterwards.
+    struct QueryOpts {
+        uint64_t io_deadline_ms{0};
+    };
+
     // ---------- detail: OIDs + concepts ----------
     namespace detail {
         // OIDs (pg_type.h)

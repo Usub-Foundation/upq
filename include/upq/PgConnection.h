@@ -890,6 +890,20 @@ namespace usub::pg {
         // (EPOLLHUP/EPOLLRDHUP).
         static constexpr uint64_t kIoDeadlineMs = 15000;
 
+        // Per-connection override of the IO deadline, 0 = kIoDeadlineMs. Set
+        // by the pool around a query that carries QueryOpts::io_deadline_ms
+        // and restored afterwards, so the override never outlives the query
+        // it was requested for. The watchdog reads it on every pass, so a
+        // change mid-await takes effect on the next tick.
+        void set_io_deadline_ms(uint64_t ms) noexcept {
+            io_deadline_ms_.store(ms, std::memory_order_release);
+        }
+
+        [[nodiscard]] uint64_t io_deadline_ms() const noexcept {
+            const uint64_t v = io_deadline_ms_.load(std::memory_order_acquire);
+            return v ? v : kIoDeadlineMs;
+        }
+
         // Steady-clock timestamp (ms) of the await currently in flight, 0 when
         // no query-path await is parked. Read by the pool watchdog.
         [[nodiscard]] uint64_t io_await_since_ms() const noexcept {
@@ -935,6 +949,7 @@ namespace usub::pg {
         bool connected_{false};
         std::atomic<bool> io_timed_out_{false};
         std::atomic<uint64_t> await_since_ms_{0};
+        std::atomic<uint64_t> io_deadline_ms_{0}; // 0 = kIoDeadlineMs
 
         std::unique_ptr<
             usub::uvent::net::Socket<
