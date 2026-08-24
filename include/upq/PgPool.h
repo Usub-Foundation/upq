@@ -120,6 +120,11 @@ namespace usub::pg {
         usub::uvent::task::Awaitable<QueryResult>
         query_awaitable(std::string sql, Args &&... args);
 
+        // Same, with per-query options (see QueryOpts in PgTypes.h).
+        template<typename... Args>
+        usub::uvent::task::Awaitable<QueryResult>
+        query_awaitable(QueryOpts opts, std::string sql, Args &&... args);
+
         template<class T>
         usub::uvent::task::Awaitable<std::vector<T> >
         query_on_reflect(std::shared_ptr<PgConnectionLibpq> const &conn,
@@ -297,16 +302,20 @@ namespace usub::pg {
 
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
-        query_reflect_expected(std::string sql, Args &&... args) {
+        query_reflect_expected(QueryOpts opts, std::string sql, Args &&... args) {
             for (int attempt = 0;; ++attempt) {
                 auto c = co_await acquire_connection();
                 if (!c)
                     co_return std::unexpected(c.error());
 
                 auto conn = *c;
+                if (opts.io_deadline_ms)
+                    conn->set_io_deadline_ms(opts.io_deadline_ms);
                 // args are passed as lvalues: a retry must not observe
                 // moved-from arguments.
                 auto res = co_await query_on_reflect_expected<T>(conn, sql, args...);
+                if (opts.io_deadline_ms)
+                    conn->set_io_deadline_ms(0);
 
                 if (!res) {
                     mark_dead(conn);
@@ -321,6 +330,12 @@ namespace usub::pg {
 
                 co_return res;
             }
+        }
+
+        template<class T, typename... Args>
+        usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
+        query_reflect_expected(std::string sql, Args &&... args) {
+            return query_reflect_expected<T>(QueryOpts{}, std::move(sql), std::forward<Args>(args)...);
         }
 
         template<class T, typename... Args>
@@ -382,6 +397,18 @@ namespace usub::pg {
             assert(detail::count_pg_params(sv) == actual &&
                 "pg: $N placeholder count does not match argument count");
             return query_awaitable(std::string(sv), std::forward<Args>(args)...);
+        }
+
+        template<typename Sql, typename... Args>
+            requires (std::is_convertible_v<Sql, std::string_view>
+                      && !std::is_same_v<std::decay_t<Sql>, std::string>)
+        usub::uvent::task::Awaitable<QueryResult>
+        query_awaitable(QueryOpts opts, Sql &&sql, Args &&... args) {
+            constexpr size_t actual = detail::count_total_params<Args...>();
+            const std::string_view sv(sql);
+            assert(detail::count_pg_params(sv) == actual &&
+                "pg: $N placeholder count does not match argument count");
+            return query_awaitable(opts, std::string(sv), std::forward<Args>(args)...);
         }
 
         template<class T, typename Sql>
@@ -538,6 +565,18 @@ namespace usub::pg {
             assert(detail::count_pg_params(sv) == actual &&
                 "pg: $N placeholder count does not match argument count");
             return query_reflect_expected<T>(std::string(sv), std::forward<Args>(args)...);
+        }
+
+        template<class T, typename Sql, typename... Args>
+            requires (std::is_convertible_v<Sql, std::string_view>
+                      && !std::is_same_v<std::decay_t<Sql>, std::string>)
+        usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
+        query_reflect_expected(QueryOpts opts, Sql &&sql, Args &&... args) {
+            constexpr size_t actual = detail::count_total_params<Args...>();
+            const std::string_view sv(sql);
+            assert(detail::count_pg_params(sv) == actual &&
+                "pg: $N placeholder count does not match argument count");
+            return query_reflect_expected<T>(opts, std::string(sv), std::forward<Args>(args)...);
         }
 
         template<class T, typename Sql, typename... Args>
@@ -806,6 +845,12 @@ namespace usub::pg {
     template<typename... Args>
     usub::uvent::task::Awaitable<QueryResult>
     PgPool::query_awaitable(std::string sql, Args &&... args) {
+        return query_awaitable(QueryOpts{}, std::move(sql), std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    usub::uvent::task::Awaitable<QueryResult>
+    PgPool::query_awaitable(QueryOpts opts, std::string sql, Args &&... args) {
         for (int attempt = 0;; ++attempt) {
             auto c = co_await acquire_connection();
             if (!c) {
@@ -820,8 +865,12 @@ namespace usub::pg {
             }
 
             auto conn = *c;
+            if (opts.io_deadline_ms)
+                conn->set_io_deadline_ms(opts.io_deadline_ms);
 
             QueryResult qr = co_await query_on(conn, sql, args...);
+            if (opts.io_deadline_ms)
+                conn->set_io_deadline_ms(0);
 
             if (is_transient_pooler_error(qr)) {
                 mark_dead(conn);
