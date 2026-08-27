@@ -1049,6 +1049,7 @@ namespace usub::pg {
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
                 out.error = io_error_message();
+                out.err_detail.message = out.error; // callers that log err_detail see it too
                 co_return out;
             }
         }
@@ -1137,6 +1138,7 @@ namespace usub::pg {
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
                 out.error = io_error_message();
+                out.err_detail.message = out.error; // callers that log err_detail see it too
                 co_return out;
             }
         }
