@@ -103,6 +103,8 @@ namespace usub::pg
                 conn_.reset();
                 co_return std::make_optional(std::move(err));
             }
+            if (io_deadline_ms_)
+                conn_->set_io_deadline_ms(io_deadline_ms_);
 
             if (emulate_readonly_autocommit_)
             {
@@ -310,6 +312,8 @@ namespace usub::pg
         }
 
         conn_ = *c;
+        if (io_deadline_ms_)
+            conn_->set_io_deadline_ms(io_deadline_ms_);
         co_return true;
     }
 

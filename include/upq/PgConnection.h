@@ -924,8 +924,12 @@ namespace usub::pg {
         void mark_await_end() noexcept;
 
         // libpq's own message after a failed flush/pump, or the watchdog's
-        // "io deadline exceeded" when the await was cut short (libpq has no
-        // error of its own in that case, so the message would come out empty).
+        // "io deadline exceeded (...)" when the await was cut short (libpq has
+        // no error of its own in that case, so the message would come out
+        // empty). The watchdog variant carries waited_ms / deadline_ms and
+        // pending_bytes = FIONREAD on the socket at the moment of the abort:
+        // >0 means the reply DID arrive and the parked coroutine was never
+        // woken (poller/wakeup bug), 0 means the peer really went silent.
         [[nodiscard]] const char *io_error_message() const noexcept;
 
         usub::uvent::task::Awaitable<void> wait_readable();
@@ -950,6 +954,9 @@ namespace usub::pg {
         std::atomic<bool> io_timed_out_{false};
         std::atomic<uint64_t> await_since_ms_{0};
         std::atomic<uint64_t> io_deadline_ms_{0}; // 0 = kIoDeadlineMs
+        // Written by the watchdog thread before the release-store of
+        // io_timed_out_, read by the coroutine after its acquire-load.
+        std::string io_timeout_detail_;
 
         std::unique_ptr<
             usub::uvent::net::Socket<
@@ -1041,7 +1048,7 @@ namespace usub::pg {
             co_await wait_writable();
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = "io deadline exceeded";
+                out.error = io_error_message();
                 co_return out;
             }
         }
@@ -1129,7 +1136,7 @@ namespace usub::pg {
             co_await wait_readable();
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = "io deadline exceeded";
+                out.error = io_error_message();
                 co_return out;
             }
         }

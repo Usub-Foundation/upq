@@ -579,6 +579,20 @@ namespace usub::pg {
         bool is_committed() const noexcept { return committed_; }
         bool is_rolled_back() const noexcept { return rolled_back_; }
 
+        // Per-transaction IO deadline (see QueryOpts::io_deadline_ms): bounds
+        // every socket await of every statement run on this transaction's
+        // connection, 0 = the connection default (kIoDeadlineMs). Applies to
+        // the current connection at once and to any connection acquired later
+        // (begin / transient re-acquire); the pool resets the override when the
+        // connection is released, so it never leaks into other users.
+        void set_io_deadline_ms(uint64_t ms) noexcept {
+            io_deadline_ms_ = ms;
+            if (conn_)
+                conn_->set_io_deadline_ms(ms);
+        }
+
+        [[nodiscard]] uint64_t io_deadline_ms() const noexcept { return io_deadline_ms_; }
+
         class PgSubtransaction {
         public:
             PgSubtransaction(PgTransaction &parent, std::string savepoint_name);
@@ -785,6 +799,7 @@ namespace usub::pg {
         bool rolled_back_{false};
 
         bool emulate_readonly_autocommit_{false};
+        uint64_t io_deadline_ms_{0}; // 0 = connection default
 
         // Replaces conn_ with a fresh pool connection after a transient
         // pooler error (emulated-readonly mode only, where every statement
