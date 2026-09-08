@@ -924,8 +924,12 @@ namespace usub::pg {
         void mark_await_end() noexcept;
 
         // libpq's own message after a failed flush/pump, or the watchdog's
-        // "io deadline exceeded" when the await was cut short (libpq has no
-        // error of its own in that case, so the message would come out empty).
+        // "io deadline exceeded (...)" when the await was cut short (libpq has
+        // no error of its own in that case, so the message would come out
+        // empty). The watchdog variant carries waited_ms / deadline_ms and
+        // pending_bytes = FIONREAD on the socket at the moment of the abort:
+        // >0 means the reply DID arrive and the parked coroutine was never
+        // woken (poller/wakeup bug), 0 means the peer really went silent.
         [[nodiscard]] const char *io_error_message() const noexcept;
 
         usub::uvent::task::Awaitable<void> wait_readable();
@@ -950,6 +954,9 @@ namespace usub::pg {
         std::atomic<bool> io_timed_out_{false};
         std::atomic<uint64_t> await_since_ms_{0};
         std::atomic<uint64_t> io_deadline_ms_{0}; // 0 = kIoDeadlineMs
+        // Written by the watchdog thread before the release-store of
+        // io_timed_out_, read by the coroutine after its acquire-load.
+        std::string io_timeout_detail_;
 
         std::unique_ptr<
             usub::uvent::net::Socket<
@@ -1030,6 +1037,8 @@ namespace usub::pg {
         }
 
         for (;;) {
+            if (sock_ && sock_->get_raw_header()->is_write_armed())
+                sock_->get_raw_header()->disarm_write();
             const int fr = PQflush(conn_);
             if (fr == 0) break;
             if (fr == -1) {
@@ -1041,7 +1050,8 @@ namespace usub::pg {
             co_await wait_writable();
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = "io deadline exceeded";
+                out.error = io_error_message();
+                out.err_detail.message = out.error; // callers that log err_detail see it too
                 co_return out;
             }
         }
@@ -1120,16 +1130,19 @@ namespace usub::pg {
                     co_return out;
                 }
 
-                if (!sock_ || !sock_->get_raw_header()->has_unread_bytes()) {
-                    if (sock_) sock_->get_raw_header()->disarm_read();
-                    break;
+                if (sock_) {
+                    auto* hdr = sock_->get_raw_header();
+                    if (hdr->is_read_armed()) hdr->disarm_read();
+                    if (hdr->has_unread_bytes()) continue;
                 }
+                break;
             }
 
             co_await wait_readable();
             if (io_timed_out_) {
                 out.code = PgErrorCode::SocketReadFailed;
-                out.error = "io deadline exceeded";
+                out.error = io_error_message();
+                out.err_detail.message = out.error; // callers that log err_detail see it too
                 co_return out;
             }
         }

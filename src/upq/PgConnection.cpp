@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 
 namespace usub::pg {
@@ -188,6 +189,8 @@ namespace usub::pg {
 
     usub::uvent::task::Awaitable<bool> PgConnectionLibpq::flush_outgoing() {
         for (;;) {
+            if (sock_ && sock_->get_raw_header()->is_write_armed())
+                sock_->get_raw_header()->disarm_write();
             const int fr = PQflush(conn_);
             if (fr == 0) co_return true;
             if (fr == -1) {
@@ -208,10 +211,12 @@ namespace usub::pg {
                 }
                 if (!PQisBusy(conn_)) co_return true;
 
-                if (!sock_ || !sock_->get_raw_header()->has_unread_bytes()) {
-                    if (sock_) sock_->get_raw_header()->disarm_read();
-                    break;
+                if (sock_) {
+                    auto* hdr = sock_->get_raw_header();
+                    if (hdr->is_read_armed()) hdr->disarm_read();
+                    if (hdr->has_unread_bytes()) continue;
                 }
+                break;
             }
 
             co_await wait_readable();
@@ -241,7 +246,7 @@ namespace usub::pg {
 
     const char *PgConnectionLibpq::io_error_message() const noexcept {
         if (io_timed_out())
-            return "io deadline exceeded";
+            return io_timeout_detail_.empty() ? "io deadline exceeded" : io_timeout_detail_.c_str();
         const char *m = conn_ ? PQerrorMessage(conn_) : nullptr;
         return m ? m : "";
     }
@@ -256,10 +261,24 @@ namespace usub::pg {
             return false;
         // The await may have completed between the watchdog's read of
         // io_await_since_ms() and now; only a still-parked await is cut.
-        if (await_since_ms_.load(std::memory_order_acquire) == 0)
+        const uint64_t since = await_since_ms_.load(std::memory_order_acquire);
+        if (since == 0)
             return false;
-        io_timed_out_.store(true, std::memory_order_release);
         const int fd = PQsocket(conn_);
+        // Diagnostics for the post-mortem: how long the await sat and whether
+        // the kernel already holds a reply nobody consumed. Composed BEFORE the
+        // release-store below, so the woken coroutine sees it (acquire-load).
+        int pending = -1;
+        if (fd >= 0 && ::ioctl(fd, FIONREAD, &pending) != 0)
+            pending = -1;
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                      "io deadline exceeded (waited_ms=%llu deadline_ms=%llu pending_bytes=%d)",
+                      static_cast<unsigned long long>(steady_now_ms() - since),
+                      static_cast<unsigned long long>(io_deadline_ms()),
+                      pending);
+        io_timeout_detail_ = buf;
+        io_timed_out_.store(true, std::memory_order_release);
         if (fd < 0)
             return false;
         // Wakes the parked coroutine through the owner worker's poller
@@ -270,8 +289,11 @@ namespace usub::pg {
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable() {
+        auto* hdr = sock_->get_raw_header();
+        if (hdr->is_read_armed()) hdr->disarm_read();
+        if (hdr->has_unread_bytes()) co_return;
         mark_await_begin();
-        co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
+        co_await usub::uvent::net::detail::AwaiterRead{hdr};
         mark_await_end();
         co_return;
     }
@@ -284,9 +306,10 @@ namespace usub::pg {
     }
 
     usub::uvent::task::Awaitable<void> PgConnectionLibpq::wait_readable_for_listener() {
-        // LISTEN sockets legitimately park for hours: no watchdog here, so the
-        // await timestamp is deliberately not published.
-        co_await usub::uvent::net::detail::AwaiterRead{sock_->get_raw_header()};
+        auto* hdr = sock_->get_raw_header();
+        if (hdr->is_read_armed()) hdr->disarm_read();
+        if (hdr->has_unread_bytes()) co_return;
+        co_await usub::uvent::net::detail::AwaiterRead{hdr};
         co_return;
     }
 
@@ -555,6 +578,8 @@ namespace usub::pg {
             }
 
             if (rc == 0) {
+                if (sock_ && sock_->get_raw_header()->is_read_armed())
+                    sock_->get_raw_header()->disarm_read();
                 if (sock_ && sock_->get_raw_header()->has_unread_bytes()) {
                     if (PQconsumeInput(conn_) == 0) {
                         out.ok = false;
@@ -565,12 +590,11 @@ namespace usub::pg {
                     }
                     continue;
                 }
-                if (sock_) sock_->get_raw_header()->disarm_read();
                 co_await wait_readable();
                 if (io_timed_out()) {
                     out.ok = false;
                     out.err.code = PgErrorCode::SocketReadFailed;
-                    out.err.message = "io deadline exceeded";
+                    out.err.message = io_error_message();
                     co_return out;
                 }
                 if (PQconsumeInput(conn_) == 0) {

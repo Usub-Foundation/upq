@@ -277,6 +277,10 @@ namespace usub::pg {
         if (!conn) {
             co_return;
         }
+        // A transaction-scoped IO deadline (PgTransaction::set_io_deadline_ms)
+        // must not outlive its transaction: whoever gets this connection next
+        // starts from the connection default.
+        conn->set_io_deadline_ms(0);
 
         if (!conn->connected()) {
 #if UPQ_POOL_DEBUG
