@@ -1037,6 +1037,8 @@ namespace usub::pg {
         }
 
         for (;;) {
+            if (sock_ && sock_->get_raw_header()->is_write_armed())
+                sock_->get_raw_header()->disarm_write();
             const int fr = PQflush(conn_);
             if (fr == 0) break;
             if (fr == -1) {
@@ -1128,10 +1130,12 @@ namespace usub::pg {
                     co_return out;
                 }
 
-                if (!sock_ || !sock_->get_raw_header()->has_unread_bytes()) {
-                    if (sock_) sock_->get_raw_header()->disarm_read();
-                    break;
+                if (sock_) {
+                    auto* hdr = sock_->get_raw_header();
+                    if (hdr->is_read_armed()) hdr->disarm_read();
+                    if (hdr->has_unread_bytes()) continue;
                 }
+                break;
             }
 
             co_await wait_readable();
