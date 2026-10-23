@@ -231,4 +231,24 @@ pool.release_connection(conn);
 
 * No exceptions from pool API — structured results only.
 * `QueryResult` contains: `ok`, `code`, `error`, `err_detail{sqlstate, detail, hint, category}`
-* `*_expected` returns `std::expected<..., PgOpError>` 
+* `*_expected` returns `std::expected<..., PgOpError>`
+
+### Retries inside the pool
+
+The pool-level entry points (`query_awaitable`, `query_reflect_expected`, `exec_reflect`) run a statement on a
+freshly acquired connection and apply two independent retry policies:
+
+* **Transient pooler SQLSTATEs** (`08P01`, `28P01`, `53300`, `57P03`) — the pooler/server rejected the
+  session before running anything; the pool retries with exponential backoff (`transient_retries` in
+  `HealthStats`). Always on, safe for writes.
+* **Connection loss** — `ConnectionClosed` / `SocketReadFailed` without an IO-deadline abort: the pooled
+  socket died under the statement (peer EOF/RST, pooler restart). Opt-in per query via
+  `QueryOpts{.retry_on_connection_loss = true}`: one immediate re-run on a fresh connection
+  (`connection_loss_retries` in `HealthStats`). **The caller asserts idempotency** — a mid-flight loss
+  cannot tell whether the server applied the statement, so this is for SELECTs and upserts keyed by a
+  client-generated id. IO-deadline aborts (`io_timed_out()`) and server `ERROR`s are never retried here.
+
+```cpp
+usub::pg::QueryOpts opts{.io_deadline_ms = 3000, .retry_on_connection_loss = true};
+auto rows = co_await pool.query_reflect_expected<Row>(opts, "SELECT ... WHERE id = $1", id);
+``` 

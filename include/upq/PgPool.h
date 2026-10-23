@@ -34,6 +34,9 @@ namespace usub::pg {
         std::atomic<uint64_t> transient_retries{0};
         // Awaits cut short by io_watchdog_loop() (see PgConnectionLibpq::kIoDeadlineMs).
         std::atomic<uint64_t> io_watchdog_aborts{0};
+        // Statements re-run on a fresh connection after the pooled one died
+        // under them (QueryOpts::retry_on_connection_loss).
+        std::atomic<uint64_t> connection_loss_retries{0};
     };
 
     inline bool is_fatal_connection_error(const QueryResult &qr) {
@@ -77,6 +80,16 @@ namespace usub::pg {
 
     inline bool is_transient_pooler_error(const QueryResult &qr) {
         return !qr.ok && is_transient_pooler_sqlstate(qr.err_detail.sqlstate);
+    }
+
+    // The connection died under the statement: not a server ERROR (that is
+    // ServerError with a SQLSTATE) and not the IO watchdog cutting a parked
+    // await (io_timed_out() — the statement may still be running). Only then
+    // is a second attempt on a fresh connection meaningful; whether it is
+    // *safe* is the caller's call (QueryOpts::retry_on_connection_loss).
+    inline bool is_connection_loss(PgErrorCode code, const PgConnectionLibpq &conn) {
+        return (code == PgErrorCode::ConnectionClosed || code == PgErrorCode::SocketReadFailed) &&
+               !conn.io_timed_out();
     }
 
     class PgPool {
@@ -303,6 +316,7 @@ namespace usub::pg {
         template<class T, typename... Args>
         usub::uvent::task::Awaitable<std::expected<std::vector<T>, PgOpError> >
         query_reflect_expected(QueryOpts opts, std::string sql, Args &&... args) {
+            bool loss_retried = false;
             for (int attempt = 0;; ++attempt) {
                 auto c = co_await acquire_connection();
                 if (!c)
@@ -322,6 +336,14 @@ namespace usub::pg {
                     if (is_transient_pooler_error(res.error().err_detail) &&
                         attempt + 1 < transient_retry_attempts_) {
                         co_await transient_backoff(attempt, res.error().err_detail.sqlstate.c_str());
+                        continue;
+                    }
+                    // Dead pooled connection: one immediate re-run on a fresh
+                    // one (no backoff — nothing is overloaded, a socket died).
+                    if (opts.retry_on_connection_loss && !loss_retried &&
+                        is_connection_loss(res.error().code, *conn)) {
+                        loss_retried = true;
+                        stats_.connection_loss_retries.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                 } else {
@@ -851,6 +873,7 @@ namespace usub::pg {
     template<typename... Args>
     usub::uvent::task::Awaitable<QueryResult>
     PgPool::query_awaitable(QueryOpts opts, std::string sql, Args &&... args) {
+        bool loss_retried = false;
         for (int attempt = 0;; ++attempt) {
             auto c = co_await acquire_connection();
             if (!c) {
@@ -880,6 +903,14 @@ namespace usub::pg {
                 }
             } else if (is_fatal_connection_error(qr)) {
                 mark_dead(conn);
+                // Dead pooled connection: one immediate re-run on a fresh one
+                // (see QueryOpts::retry_on_connection_loss).
+                if (opts.retry_on_connection_loss && !loss_retried &&
+                    is_connection_loss(qr.code, *conn)) {
+                    loss_retried = true;
+                    stats_.connection_loss_retries.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
             } else {
                 co_await release_connection_async(conn);
             }

@@ -160,6 +160,16 @@ namespace usub::pg {
     // connection for the duration of the query and restored afterwards.
     struct QueryOpts {
         uint64_t io_deadline_ms{0};
+        // Retry the statement once on a fresh connection when the pooled
+        // connection turns out to be dead under it: ConnectionClosed before
+        // the send, or SocketReadFailed with the socket gone (peer EOF/RST,
+        // pooler restart). Opt-in — the caller asserts the statement is
+        // idempotent (a SELECT, an upsert keyed by a client-generated id):
+        // a mid-flight loss cannot tell whether the server applied it.
+        // Never retries IO-deadline aborts (the statement may still be
+        // executing server-side) or server ERRORs; transient pooler
+        // SQLSTATEs keep their own backoff retry regardless of this flag.
+        bool retry_on_connection_loss{false};
     };
 
     // ---------- detail: OIDs + concepts ----------
