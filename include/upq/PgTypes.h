@@ -170,6 +170,18 @@ namespace usub::pg {
         // executing server-side) or server ERRORs; transient pooler
         // SQLSTATEs keep their own backoff retry regardless of this flag.
         bool retry_on_connection_loss{false};
+        // The statement may be executed more than once: a SELECT, or a write
+        // that is idempotent by construction (upsert keyed by a client id).
+        // Enables, on top of the always-on NotStarted retries (see
+        // RetryClass in PgRetry.h): one re-run after a lost connection, one
+        // after an IO-deadline abort, and backoff re-runs after a server-side
+        // rollback (40001/40P01/55P03). For run_tx() it additionally allows
+        // re-running a transaction whose COMMIT outcome is unknown.
+        bool idempotent{false};
+        // Wall-clock budget for the whole call, retries and backoff included:
+        // a retry that would start after it is not made. 0 = no budget, only
+        // the per-class attempt limits apply.
+        uint64_t retry_budget_ms{0};
     };
 
     // ---------- detail: OIDs + concepts ----------

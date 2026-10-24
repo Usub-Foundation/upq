@@ -12,7 +12,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <ios>
+#include <stdexcept>
 #include <istream>
 #include <optional>
 #include <sstream>
@@ -598,6 +600,17 @@ namespace usub::pg {
             return -1;
         }
 
+        // Error text for a positional decode failure (built only on failure).
+        template <class Field>
+        inline std::string positional_mismatch(std::size_t i, const std::vector<std::string> *col_names,
+                                               const std::vector<uint32_t> *col_oids, std::string_view sv) {
+            const std::string col_type =
+                (col_oids && i < col_oids->size()) ? pg_type_name_from_oid((*col_oids)[i]) : "unknown";
+            const std::string_view col_name =
+                (col_names && i < col_names->size()) ? std::string_view((*col_names)[i]) : std::string_view{};
+            return format_mismatch_positional(i, expect_type<Field>(), i, col_name, col_type, preview_val(sv));
+        }
+
         template <class Tuple>
             requires is_tuple_like_v<Tuple>
         inline bool fill_from_row_positional_ex(const QueryResult::Row &row,
@@ -618,23 +631,14 @@ namespace usub::pg {
                 (
                     [&] {
                         using Elem = std::tuple_element_t<I, Tup>;
-                        const auto &sv = row.cols[I];
+                        const std::string_view sv(row.cols[I]);
                         Elem tmp{};
-
-                        std::string col_type = "unknown";
-                        std::string col_name;
-                        if (col_oids && I < col_oids->size())
-                            col_type = pg_type_name_from_oid((*col_oids)[I]);
-                        if (col_names && I < col_names->size()) col_name = (*col_names)[I];
-
-                        if (!Decoder<Elem>::apply(std::string_view(sv.data(), sv.size()), tmp)) {
-                            if (err)
-                                *err = format_mismatch_positional(
-                                    I, expect_type<Elem>(), I, col_name, col_type,
-                                    preview_val(std::string_view(sv.data(), sv.size())));
-                            ok = false;
-                        } else {
+                        if (Decoder<Elem>::apply(sv, tmp)) {
                             std::get<I>(dst) = std::move(tmp);
+                        } else {
+                            if (err)
+                                *err = positional_mismatch<Elem>(I, col_names, col_oids, sv);
+                            ok = false;
                         }
                     }(),
                     ...);
@@ -664,23 +668,14 @@ namespace usub::pg {
                 (
                     [&] {
                         using FieldT = std::remove_reference_t<decltype(ureflect::get<I>(tie))>;
-                        const auto &sv = row.cols[I];
+                        const std::string_view sv(row.cols[I]);
                         FieldT tmp{};
-
-                        std::string col_type = "unknown";
-                        std::string col_name;
-                        if (col_oids && I < col_oids->size())
-                            col_type = pg_type_name_from_oid((*col_oids)[I]);
-                        if (col_names && I < col_names->size()) col_name = (*col_names)[I];
-
-                        if (!Decoder<FieldT>::apply(std::string_view(sv.data(), sv.size()), tmp)) {
-                            if (err)
-                                *err = format_mismatch_positional(
-                                    I, expect_type<FieldT>(), I, col_name, col_type,
-                                    preview_val(std::string_view(sv.data(), sv.size())));
-                            ok = false;
-                        } else {
+                        if (Decoder<FieldT>::apply(sv, tmp)) {
                             ureflect::get<I>(tie) = std::move(tmp);
+                        } else {
+                            if (err)
+                                *err = positional_mismatch<FieldT>(I, col_names, col_oids, sv);
+                            ok = false;
                         }
                     }(),
                     ...);
@@ -689,64 +684,68 @@ namespace usub::pg {
             return ok;
         }
 
+        // Field -> column index map for one result set, computed once per
+        // result instead of once per row (normalising every column name and
+        // field name and scanning for each field is O(fields * columns)).
         template <class T>
             requires ReflectAggregate<T>
-        inline bool fill_from_row_named(const QueryResult &qr, size_t row_index, T &dst,
-                                        std::string *err) {
+        struct NamedPlan {
+            static constexpr std::size_t N = ureflect::count_members<std::decay_t<T>>;
+            int col[N]{};
+            bool usable{false};
+            std::string why;  // set when !usable and an explanation was asked for
+        };
+
+        template <class T>
+            requires ReflectAggregate<T>
+        inline NamedPlan<T> make_named_plan(const std::vector<std::string> &columns,
+                                            bool explain) {
             using V = std::decay_t<T>;
             constexpr std::size_t N = ureflect::count_members<V>;
+            NamedPlan<T> plan;
 
-            if (row_index >= qr.rows.size()) {
-                if (err)
-                    *err = "row out of range: row=" + std::to_string(row_index) +
-                           ", total_rows=" + std::to_string(qr.rows.size());
-                return false;
-            }
-            const auto &row = qr.rows[row_index];
-
-            if (qr.columns.empty()) {
-                if (err) *err = "columns are empty (driver didn't fill names)";
-                return false;
+            if (columns.empty()) {
+                if (explain) plan.why = "columns are empty (driver didn't fill names)";
+                return plan;
             }
 
             std::vector<std::string> norm_cols;
-            norm_cols.reserve(qr.columns.size());
-            for (auto &c : qr.columns) norm_cols.emplace_back(normalize_ident(c));
+            norm_cols.reserve(columns.size());
+            for (auto &c : columns) norm_cols.emplace_back(normalize_ident(c));
 
 #if UPQ_REFLECT_DEBUG
-            UPQ_LOG("[UPQ/reflect] columns[%zu]: %s", norm_cols.size(),
-                    join_csv(qr.columns).c_str());
+            UPQ_LOG("[UPQ/reflect] columns[%zu]: %s", norm_cols.size(), join_csv(columns).c_str());
 #endif
 
             constexpr auto fnames = ureflect::member_names<V>;
-            std::array<std::string, N> norm_fields{};
-            [&]<std::size_t... I>(std::index_sequence<I...>) {
-                ((norm_fields[I] = normalize_ident(fnames[I])), ...);
-            }(std::make_index_sequence<N>{});
-
-            int col_map[N];
             bool all_found = true;
             std::vector<std::string> missing;
-
-            [&]<std::size_t... I>(std::index_sequence<I...>) {
-                (([&] {
-                     const int idx = find_col_idx(norm_cols, norm_fields[I]);
-                     col_map[I] = idx;
-                     if (idx < 0) {
-                         all_found = false;
-                         missing.emplace_back(norm_fields[I]);
-                     }
-                 }()),
-                 ...);
-            }(std::make_index_sequence<N>{});
+            for (std::size_t i = 0; i < N; ++i) {
+                std::string field = normalize_ident(fnames[i]);
+                plan.col[i] = find_col_idx(norm_cols, field);
+                if (plan.col[i] < 0) {
+                    all_found = false;
+                    if (explain) missing.emplace_back(std::move(field));
+                }
+            }
 
             if (!all_found) {
-                if (err) {
-                    *err = "not all fields matched by name: missing=[" + join_csv(missing) +
-                           "], available_cols=[" + join_csv(qr.columns) + "]";
-                }
-                return false;
+                if (explain)
+                    plan.why = "not all fields matched by name: missing=[" + join_csv(missing) +
+                               "], available_cols=[" + join_csv(columns) + "]";
+                return plan;
             }
+            plan.usable = true;
+            return plan;
+        }
+
+        template <class T>
+            requires ReflectAggregate<T>
+        inline bool decode_named(const NamedPlan<T> &plan, const std::vector<std::string> &columns,
+                                 const QueryResult::Row &row, T &dst, std::string *err) {
+            using V = std::decay_t<T>;
+            constexpr std::size_t N = ureflect::count_members<V>;
+            constexpr auto fnames = ureflect::member_names<V>;
 
             auto tie = ureflect::to_tie(dst);
             bool ok = true;
@@ -754,28 +753,22 @@ namespace usub::pg {
                 (
                     [&] {
                         using FieldT = std::remove_reference_t<decltype(ureflect::get<I>(tie))>;
-                        const int c = col_map[I];
-                        const auto &sv = row.cols[static_cast<size_t>(c)];
-                        FieldT tmp{};
-
-                        std::string col_type = "unknown";
-#ifdef UPQ_RESULT_HAS_COLUMN_OIDS
-                        if (c >= 0 && static_cast<size_t>(c) < qr.column_oids.size())
-                            col_type =
-                                pg_type_name_from_oid(qr.column_oids[static_cast<size_t>(c)]);
-#endif
-
-                        if (!Decoder<FieldT>::apply(std::string_view(sv.data(), sv.size()), tmp)) {
-                            if (err) {
-                                *err = format_mismatch_named(
-                                    fnames[I], expect_type<FieldT>(),
-                                    qr.columns[static_cast<size_t>(c)], col_type,
-                                    preview_val(std::string_view(sv.data(), sv.size())));
-                            }
+                        const auto c = static_cast<std::size_t>(plan.col[I]);
+                        if (c >= row.cols.size()) {
+                            if (err) *err = "column index out of row bounds";
                             ok = false;
-                        } else {
-                            ureflect::get<I>(tie) = std::move(tmp);
+                            return;
                         }
+                        const std::string_view sv(row.cols[c]);
+                        FieldT tmp{};
+                        if (Decoder<FieldT>::apply(sv, tmp)) {
+                            ureflect::get<I>(tie) = std::move(tmp);
+                            return;
+                        }
+                        if (err)
+                            *err = format_mismatch_named(fnames[I], expect_type<FieldT>(), columns[c],
+                                                         "unknown", preview_val(sv));
+                        ok = false;
                     }(),
                     ...);
             }(std::make_index_sequence<N>{});
@@ -783,6 +776,35 @@ namespace usub::pg {
             if (!ok && err && err->empty()) *err = "failed to decode aggregate field (named)";
             return ok;
         }
+
+        template <class T>
+            requires ReflectAggregate<T>
+        inline bool fill_from_row_named(const QueryResult &qr, size_t row_index, T &dst,
+                                        std::string *err) {
+            if (row_index >= qr.rows.size()) {
+                if (err)
+                    *err = "row out of range: row=" + std::to_string(row_index) +
+                           ", total_rows=" + std::to_string(qr.rows.size());
+                return false;
+            }
+            const auto plan = make_named_plan<T>(qr.columns, err != nullptr);
+            if (!plan.usable) {
+                if (err) *err = plan.why;
+                return false;
+            }
+            return decode_named(plan, qr.columns, qr.rows[row_index], dst, err);
+        }
+
+        // Rows of `qr` as T: by column name when every field has a column,
+        // otherwise (or when any named decode fails) positionally. Positional
+        // failure throws std::runtime_error, exactly like the public
+        // map_*_reflect_* pair this replaces, but the named attempt itself
+        // never throws, so the common fallback costs no exception.
+        template <class T>
+        inline std::vector<T> map_rows_named_or_positional(const QueryResult &qr);
+
+        template <class T>
+        inline T map_row_named_or_positional(const QueryResult &qr, std::size_t row);
     }  // namespace detail
 
     template <class T>
@@ -869,10 +891,17 @@ namespace usub::pg {
         std::string local;
         std::string *perr = err ? err : &local;
         std::vector<T> out;
+        if (qr.rows.empty()) return out;
+
+        const auto plan = detail::make_named_plan<T>(qr.columns, true);
+        if (!plan.usable) {
+            *perr = "row=0: " + plan.why;
+            throw std::runtime_error(*perr);
+        }
         out.reserve(qr.rows.size());
         for (size_t i = 0; i < qr.rows.size(); ++i) {
             T dst{};
-            if (!map_row_reflect_named(qr, i, dst, perr)) {
+            if (!detail::decode_named(plan, qr.columns, qr.rows[i], dst, perr)) {
                 if (perr->empty()) *perr = "decode failed";
                 *perr = "row=" + std::to_string(i) + ": " + *perr;
                 throw std::runtime_error(*perr);
@@ -881,6 +910,90 @@ namespace usub::pg {
         }
         return out;
     }
+
+    namespace detail {
+        template <class T>
+        inline std::vector<T> map_rows_named_or_positional(const QueryResult &qr) {
+            if (qr.rows.empty()) return {};
+            if constexpr (ReflectAggregate<T>) {
+                const auto plan = make_named_plan<T>(qr.columns, false);
+                if (plan.usable) {
+                    std::vector<T> out;
+                    out.reserve(qr.rows.size());
+                    bool ok = true;
+                    for (const auto &row : qr.rows) {
+                        T dst{};
+                        if (!decode_named(plan, qr.columns, row, dst, nullptr)) {
+                            ok = false;
+                            break;
+                        }
+                        out.emplace_back(std::move(dst));
+                    }
+                    if (ok) return out;
+                }
+            }
+            return map_all_reflect_positional<T>(qr);
+        }
+
+        template <class T>
+        inline T map_row_named_or_positional(const QueryResult &qr, std::size_t row) {
+            if constexpr (ReflectAggregate<T>) {
+                if (row < qr.rows.size()) {
+                    const auto plan = make_named_plan<T>(qr.columns, false);
+                    T dst{};
+                    if (plan.usable && decode_named(plan, qr.columns, qr.rows[row], dst, nullptr))
+                        return dst;
+                }
+            }
+            return map_single_reflect_positional<T>(qr, row);
+        }
+
+        // ---------- QueryResult -> API result conversions ----------
+        //
+        // Used as the last step of every query API (connection, pool,
+        // transaction), after the connection has been released, so a
+        // throwing positional mapping can no longer leak a pooled connection.
+
+        inline PgOpError to_op_error(const QueryResult &r) { return PgOpError{r.code, r.error, r.err_detail}; }
+
+        struct AsResult {
+            QueryResult operator()(QueryResult &&r) const { return std::move(r); }
+        };
+
+        template <class T>
+        struct AsExpectedRows {
+            std::expected<std::vector<T>, PgOpError> operator()(QueryResult &&r) const {
+                if (!r.ok) return std::unexpected(to_op_error(r));
+                return map_rows_named_or_positional<T>(r);
+            }
+        };
+
+        template <class T>
+        struct AsExpectedOne {
+            std::expected<T, PgOpError> operator()(QueryResult &&r) const {
+                if (!r.ok) return std::unexpected(to_op_error(r));
+                if (r.rows.empty()) return std::unexpected(PgOpError{PgErrorCode::Unknown, "no rows", {}});
+                return map_row_named_or_positional<T>(r, 0);
+            }
+        };
+
+        // Deprecated vector/optional flavours: errors read as "no rows".
+        template <class T>
+        struct AsRows {
+            std::vector<T> operator()(QueryResult &&r) const {
+                if (!r.ok) return {};
+                return map_rows_named_or_positional<T>(r);
+            }
+        };
+
+        template <class T>
+        struct AsOptionalRow {
+            std::optional<T> operator()(QueryResult &&r) const {
+                if (!r.ok || r.rows.empty()) return std::nullopt;
+                return map_row_named_or_positional<T>(r, 0);
+            }
+        };
+    }  // namespace detail
 }  // namespace usub::pg
 
 #endif  // PGREFLECT_H

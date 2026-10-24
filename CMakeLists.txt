@@ -142,6 +142,18 @@ else()
         target_compile_definitions(${PROJECT_NAME} PRIVATE UPQ_REFLECT_DEBUG=0)
 endif()
 
+option(UPQ_BUILD_TESTS "Build upq_tests (needs UPQ_TEST_PG / UPQ_TEST_FAKE_PORT to run)" OFF)
+if (UPQ_BUILD_TESTS)
+        add_executable(upq_tests tests/upq_tests.cpp)
+        target_link_libraries(upq_tests PRIVATE upq)
+endif()
+
+option(UPQ_BUILD_BENCH "Build upq_bench (bench/run_bench.sh)" OFF)
+if (UPQ_BUILD_BENCH)
+        add_executable(upq_bench bench/upq_bench.cpp)
+        target_link_libraries(upq_bench PRIVATE upq)
+endif()
+
 option(UPQ_BUILD_EXAMPLES "Build UPQ example executables" OFF)
 if (UPQ_BUILD_EXAMPLES)
         add_executable(upq_example examples/main.cpp)

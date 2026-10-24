@@ -84,7 +84,7 @@ auto res = co_await pool.exec_reflect(
 
 * No ORM, no hidden state machines
 * No query builders or migrations
-* No automatic retries or reconnection loops
+* No blind retries: only failures that prove a re-run safe are retried (`RetryClass`, [pool.md](pool.md))
 * No dependencies beyond `libpq` and `uvent`
 
 **Philosophy:** minimal abstractions, predictable control, and **compile-time reflection instead of boilerplate.**

@@ -150,11 +150,43 @@ auto r2 = co_await txn.query<true>("INSERT INTO logs(msg) VALUES($1)", "B");
 
 ```cpp
 bool ok = co_await txn.commit();
-if (!ok) { /* handle */ }
+if (!ok) { /* txn.last_commit_error() says why */ }
 
 co_await txn.rollback(); // explicit rollback
 co_await txn.finish();   // rollback if active, then cleanup
 ```
+
+`commit()` returns `false` when a statement inside the transaction already failed: PostgreSQL answers such a
+`COMMIT` with `ROLLBACK`, which libpq reports as success. `last_commit_error()` is then
+`{ServerError, sqlstate 25P02}`.
+
+---
+
+## Retrying a whole transaction: `run_tx`
+
+```cpp
+auto r = co_await usub::pg::run_tx(pool, [&](usub::pg::PgTransaction &tx)
+        -> usub::uvent::task::Awaitable<std::expected<Row, usub::pg::PgOpError>> {
+    auto rows = co_await tx.query_reflect_expected_one<Row>("SELECT ... FOR UPDATE", id);
+    if (!rows) co_return std::unexpected(rows.error());
+    auto upd = co_await tx.query("UPDATE ...", id);
+    if (!upd.ok) co_return std::unexpected(usub::pg::detail::to_op_error(upd));
+    co_return *rows;
+}, usub::pg::QueryOpts{.io_deadline_ms = 3000, .retry_budget_ms = 10000},
+   usub::pg::PgTransactionConfig{.isolation = usub::pg::TxIsolationLevel::ReadCommitted});
+```
+
+`run_tx` begins, awaits the body, commits; when the attempt failed in a way that left nothing committed it
+starts over on a fresh connection:
+
+* `NotStarted`, `ConnectionLost`, `Deadline`, `RolledBack` during BEGIN or the body (the server rolled the
+  transaction back);
+* `RolledBack` at COMMIT (serialization failure);
+* `ConnectionLost` / `Deadline` at COMMIT only with `QueryOpts::idempotent`: the commit may have happened.
+
+The body may run several times, so it must touch nothing but the database and must not commit or roll back
+itself. Returning an error rolls back and is returned as is (business errors are not retried); an exception
+rolls back and propagates. Lambda captures are fine: the body is awaited in place.
 
 ---
 
