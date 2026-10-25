@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "uvent/Uvent.h"
+#include "upq/PgNotificationListener.h"
 #include "upq/PgNotificationMultiplexer.h"
 #include "upq/PgPool.h"
 #ifndef UPQ_TESTS_BASELINE
@@ -882,6 +883,53 @@ namespace {
         CHECK(pool.health_stats().rollback_retries.load() == 2);
     }
 
+    // A terminated backend sends FATAL and closes at once: the bytes and the
+    // FIN arrive as one readiness edge. libpq reads the bytes and only sees
+    // the EOF on its next read, so the wait that follows must count EOF as
+    // readable; otherwise it parks for good (a statement until the IO
+    // deadline, a LISTEN session forever).
+    task::Awaitable<void> t_fake_fatal_mid_statement() {
+        auto &pool = *fake_pool(unique("fatal_1"));
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = co_await pool.query_awaitable(QueryOpts{.io_deadline_ms = 5000}, "SELECT 1");
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+        CHECK(!r.ok);
+        CHECK_MSG(classify_retry(r) == RetryClass::ConnectionLost, r.error);
+        CHECK_MSG(ms < 1000ms, std::to_string(ms.count()) + " ms: " + r.error);
+    }
+
+    task::Awaitable<void> t_fake_listen_terminated_multiplexer() {
+        const std::string db = unique("terminate_1");
+        auto &pool = *fake_pool(db);
+        auto c = co_await pool.acquire_connection();
+        CHECK(c.has_value());
+        auto *mux = new PgNotificationMultiplexer(*c, "127.0.0.1", *g_fake_port, "u", db, "p", {},
+                                                  SSLConfig{.mode = SSLMode::disable});
+        std::atomic<int> got{0};
+        CHECK((co_await mux->add_handler("upq_term", std::make_shared<CountingHandler>(&got))).has_value());
+        system::co_spawn(mux->run());
+        // FATAL + FIN 200 ms after the LISTEN; the server notifies once the
+        // multiplexer has reconnected and subscribed again.
+        CHECK_MSG(co_await wait_count(got, 1, 5000ms), "no delivery after the LISTEN session was terminated");
+    }
+
+    struct NoopListenHandler {
+        task::Awaitable<void> operator()(std::string, std::string, int) { co_return; }
+    };
+
+    task::Awaitable<void> t_fake_listen_terminated_listener() {
+        auto &pool = *fake_pool(unique("terminate_1"));
+        auto c = co_await pool.acquire_connection();
+        CHECK(c.has_value());
+        PgNotificationListener<NoopListenHandler> listener("upq_term", *c);
+        listener.setHandler(NoopListenHandler{});
+        const auto t0 = std::chrono::steady_clock::now();
+        co_await listener.run();  // returns once the connection is gone, so the caller can restart it
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+        CHECK_MSG(ms < 3000ms, std::to_string(ms.count()) + " ms");
+        CHECK(!(*c)->connected());
+    }
+
 #endif
     // ---------- pure ----------
 
@@ -1027,6 +1075,9 @@ namespace {
 #endif
 #ifndef UPQ_TESTS_BASELINE
         {"fake_deadlock", &t_fake_deadlock, 'f'},
+        {"fake_fatal_mid_statement", &t_fake_fatal_mid_statement, 'f'},
+        {"fake_listen_terminated_multiplexer", &t_fake_listen_terminated_multiplexer, 'f'},
+        {"fake_listen_terminated_listener", &t_fake_listen_terminated_listener, 'f'},
         {"fake_connect_deadline", &t_fake_connect_deadline, 'f'},
         {"connect_refused_message", &t_connect_refused_message, '-'},
 #endif

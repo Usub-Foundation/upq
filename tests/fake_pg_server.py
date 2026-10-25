@@ -17,7 +17,15 @@ statement succeeds and returns one row, one int4 column "v" = 1.
     mute         accept the TCP connection, never answer the startup
                  message (the client's connect deadline has to fire)
     deadlock     ErrorResponse 40P01
+    fatal        FATAL 57P01 instead of an answer, the FIN in the same TCP
+                 segment (what pg_terminate_backend does to a busy backend)
+    terminate    answer, then 200 ms later FATAL 57P01 + FIN in one segment
+                 (an idle LISTEN session terminated)
     ok           behave from the start (n is ignored)
+
+A LISTEN is answered with CommandComplete. On a "terminate_..." database a
+LISTEN answered normally is followed by a NotificationResponse on its channel
+(payload "back"), so a client can tell that it subscribed again.
 
     usage: fake_pg_server.py <port>
 """
@@ -47,6 +55,23 @@ def one_row() -> bytes:
     rd = struct.pack("!H", 1) + cstr("v") + struct.pack("!IHIhih", 0, 0, 23, 4, -1, 0)
     return (msg(b"T", rd) + msg(b"D", struct.pack("!H", 1) + struct.pack("!I", 1) + b"1")
             + msg(b"C", cstr("SELECT 1")))
+
+
+def fatal_and_fin(conn):
+    # Corked, the FIN rides on the data segment: the client sees one
+    # readiness edge for both, as when a terminated backend exits at once.
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+    conn.sendall(msg(b"E", b"S" + cstr("FATAL") + b"V" + cstr("FATAL") + b"C" + cstr("57P01")
+                     + b"M" + cstr("terminating connection due to administrator command") + b"\0"))
+    conn.shutdown(socket.SHUT_WR)
+
+
+def listen_channel(sql: str):
+    words = sql.strip().rstrip(";").split(None, 1)
+    if len(words) != 2 or words[0].upper() != "LISTEN":
+        return None
+    ch = words[1].strip()
+    return ch[1:-1].replace('""', '"') if ch.startswith('"') else ch
 
 
 def recv_exact(conn, n):
@@ -103,7 +128,7 @@ def serve(conn):
         while True:
             kind = recv_exact(conn, 1)
             length = struct.unpack("!I", recv_exact(conn, 4))[0]
-            recv_exact(conn, length - 4)
+            body = recv_exact(conn, length - 4)
             if kind == b"X":
                 return
             if kind in (b"Q", b"P"):  # a statement starts here
@@ -114,8 +139,24 @@ def serve(conn):
                     while conn.recv(65536):
                         pass
                     return
+                if outcome == "fatal":
+                    fatal_and_fin(conn)
+                    while conn.recv(65536):
+                        pass
+                    return
             if kind == b"Q":
-                if outcome == "ok":
+                channel = listen_channel(body.rstrip(b"\0").decode())
+                if channel is not None and outcome in ("ok", "terminate"):
+                    conn.sendall(msg(b"C", cstr("LISTEN")) + msg(b"Z", b"I"))
+                    if outcome == "terminate":
+                        threading.Event().wait(0.2)
+                        fatal_and_fin(conn)
+                        while conn.recv(65536):
+                            pass
+                        return
+                    if db.startswith("terminate"):
+                        conn.sendall(msg(b"A", struct.pack("!I", 4242) + cstr(channel) + cstr("back")))
+                elif outcome == "ok":
                     conn.sendall(one_row() + msg(b"Z", b"I"))
                 elif outcome == "notstarted":
                     conn.sendall(error("08P01", "server login has been failing, try again later "
