@@ -387,6 +387,18 @@ namespace usub::pg {
 
     // ---------- socket waits ----------
 
+    // A recv() would not block: bytes, EOF or a pending socket error. FIONREAD
+    // (SocketHeader::has_unread_bytes) says 0 at EOF, and a FIN that came with
+    // the last bytes (a terminated backend: FATAL, then close) shares their
+    // readiness edge: libpq reads the bytes, sees the EOF only on its next
+    // read, and a wait that ignored EOF would never be woken again.
+    static bool read_would_not_block(int fd) noexcept {
+        char b;
+        const ssize_t n = ::recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n >= 0) return true;
+        return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+    }
+
     bool PgConnectionLibpq::IoWait::await_ready() noexcept {
         auto *hdr = c_.sock_->get_raw_header();
         // After a HUP the poller has dropped (and closed) its registration:
@@ -399,7 +411,7 @@ namespace usub::pg {
             case Kind::ListenRead:
                 // Clear the READY hint before probing, never after (see SocketHeader::rd).
                 if (hdr->is_read_armed()) hdr->disarm_read();
-                if (hdr->has_unread_bytes()) return true;
+                if (read_would_not_block(hdr->fd)) return true;
                 break;
             case Kind::Write:
                 break;

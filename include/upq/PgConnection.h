@@ -401,8 +401,8 @@ namespace usub::pg {
         // One wait for socket readiness, awaited directly by the coroutine
         // that needs it: no frame of its own. Read waits first re-probe the
         // kernel buffer (the READY hint is cleared BEFORE the probe, as the
-        // uvent wake-up protocol requires) and do not park when data is
-        // already there. Query-path waits publish their start for the IO
+        // uvent wake-up protocol requires) and do not park when data, EOF or
+        // a socket error is already there. Query-path waits publish their start for the IO
         // watchdog; the LISTEN wait does not (it may idle forever), nor do the
         // handshake waits (connect_async bounds those itself). Handshake
         // waits probe with poll(2): libpq may ask to write on a socket that is
