@@ -54,13 +54,28 @@ co_await pool.release_connection_async(conn);  // drain & recycle
 If a connection returns with unread results/pending input:
 
 * `release_connection(conn)` **retires** the connection.
-* `release_connection_async(conn)` drains pending results and **recycles**.
+* `release_connection_async(conn)` drains pending results and **recycles** (an idle connection is recycled at
+  once, without touching the socket).
+
+Pool statements never leave unread results behind, and after a server `ERROR` (constraint, no rows, …) the
+connection goes back to the pool: only connection-level failures retire it.
 
 ### Marking a connection dead
 
 ```cpp
 pool.mark_dead(conn); // retires it; do not reuse
 ```
+
+### Connecting and the socket
+
+`connect_async(conninfo, budget)` (default budget 5 s) waits on socket readiness for every step of the handshake,
+so a new session costs what libpq's handshake costs (TCP, TLS, SCRAM), not a polling interval per step. A detached
+timer bounds the whole handshake: a server that accepts TCP and never answers fails with
+`"connect timeout after N ms"`.
+
+libpq owns its socket; the event loop watches a `dup` of it. Each side closes only its own descriptor, so a
+connection closed on another worker than the one that opened it (the usual case in a pool), or one the poller saw
+hang up, never closes a descriptor number that the process has meanwhile given to another socket.
 
 ---
 
@@ -235,20 +250,45 @@ pool.release_connection(conn);
 
 ### Retries inside the pool
 
-The pool-level entry points (`query_awaitable`, `query_reflect_expected`, `exec_reflect`) run a statement on a
-freshly acquired connection and apply two independent retry policies:
+Every pool-level statement (`query_awaitable`, `query_reflect_expected[_one]`, `exec_reflect`, the deprecated
+`query_reflect*`) acquires a connection, runs, gives the connection back and then decides about a retry from
+one classification of the failure, `usub::pg::classify_retry()` in `upq/PgRetry.h`:
 
-* **Transient pooler SQLSTATEs** (`08P01`, `28P01`, `53300`, `57P03`) — the pooler/server rejected the
-  session before running anything; the pool retries with exponential backoff (`transient_retries` in
-  `HealthStats`). Always on, safe for writes.
-* **Connection loss** — `ConnectionClosed` / `SocketReadFailed` without an IO-deadline abort: the pooled
-  socket died under the statement (peer EOF/RST, pooler restart). Opt-in per query via
-  `QueryOpts{.retry_on_connection_loss = true}`: one immediate re-run on a fresh connection
-  (`connection_loss_retries` in `HealthStats`). **The caller asserts idempotency** — a mid-flight loss
-  cannot tell whether the server applied the statement, so this is for SELECTs and upserts keyed by a
-  client-generated id. IO-deadline aborts (`io_timed_out()`) and server `ERROR`s are never retried here.
+| `RetryClass` | What happened | Retried |
+|---|---|---|
+| `NotStarted` | pooler/server refused before running anything: `08P01`, `28P01`, `53300`, `57P03` | always: pool's attempts (`set_transient_retry`, default 3) with backoff `base * 3^i` |
+| `ConnectionLost` | socket died under the statement (EOF/RST, other `08xxx`, `57P01/02`, `25P03`, libpq "server closed the connection" …) | once, immediately, with `.idempotent` (or the older `.retry_on_connection_loss`) |
+| `Deadline` | `io_deadline_ms` cut the await; the statement may still run | once, immediately, with `.idempotent` |
+| `RolledBack` | `40001`, `40P01`, `55P03`: the server rolled the statement back | up to attempts−1 times, backoff 50/100/200 ms, with `.idempotent` |
+| `None` | the statement's own error (constraint, syntax, no rows), cancellation | never |
+
+`QueryOpts::idempotent` is the caller's promise that running the statement twice is harmless (a `SELECT`, an
+upsert keyed by a client-generated id). `QueryOpts::retry_budget_ms` bounds the whole call: a retry that would
+start after it is not made.
 
 ```cpp
-usub::pg::QueryOpts opts{.io_deadline_ms = 3000, .retry_on_connection_loss = true};
+usub::pg::QueryOpts opts{.io_deadline_ms = 3000, .idempotent = true, .retry_budget_ms = 8000};
 auto rows = co_await pool.query_reflect_expected<Row>(opts, "SELECT ... WHERE id = $1", id);
-``` 
+```
+
+Every retry is counted in `HealthStats` (`transient_retries`, `connection_loss_retries`, `deadline_retries`,
+`rollback_retries`) and reported to the retry observer before its backoff:
+
+```cpp
+pool.set_retry_observer([](const usub::pg::RetryEvent &ev) {
+    ulog::warn("pg retry | class= ({}) | attempt= ({}) | sqlstate= ({}) | db= ({}) | msg= ({})",
+               usub::pg::toString(ev.cls), ev.attempt, ev.sqlstate, ev.db, ev.message);
+});
+```
+
+The observer runs on the worker that ran the statement and must not suspend; install it before the pool is
+used. Without one, each retry prints one line to stderr (the NotStarted line keeps its historical wording).
+
+A whole transaction is retried with `usub::pg::run_tx()`, see [transaction.md](transaction.md).
+
+### Stale idle connections
+
+Before an idle connection is handed out, the pool peeks at its socket (`recv(MSG_PEEK | MSG_DONTWAIT)`): a
+connection the server or pooler closed while it sat idle (restart, idle timeout, `pg_terminate_backend`) is
+dropped there, before anything is sent, and counted in `HealthStats::stale_dropped`. This catches orderly
+closes and resets the poller already saw; a peer that vanished silently is still found by the IO deadline. 

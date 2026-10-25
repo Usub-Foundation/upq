@@ -2,17 +2,14 @@
 #define PGNOTIFICATIONMULTIPLEXER_H
 
 #include <libpq-fe.h>
-
-#ifdef _WIN32
-#  include <winsock2.h>
-#else
-#  include <sys/ioctl.h>
-#endif
+#include <sys/socket.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,8 +22,9 @@
 #include "PgConnection.h"
 #include "PgTypes.h"
 #include "utils/ConnInfo.h"
+#include "utils/UventCompat.h"
 #include "uvent/Uvent.h"
-#include "uvent/utils/datastructures/queue/ConcurrentQueues.h"
+#include "uvent/sync/AsyncEvent.h"
 
 namespace usub::pg {
     struct IPgNotifyHandler {
@@ -37,14 +35,29 @@ namespace usub::pg {
         virtual ~IPgNotifyHandler() = default;
     };
 
+    // LISTEN/NOTIFY fan-out over one dedicated connection.
+    //
+    // Who owns the connection: before run(), add_handler() sends its LISTEN
+    // itself (such calls must not overlap). From run() on, the run loop is
+    // the only reader of the socket; a subscription change is queued and
+    // sent by whoever finds the connection free, and the run loop, woken by
+    // the reply, completes it. Every libpq call on the connection happens
+    // under mtx_ in a short section without suspension, so callers on other
+    // workers are safe.
+    //
+    // Nothing that arrives is dropped. A notification goes to each matching
+    // handler in a detached coroutine of its own, started in arrival order;
+    // per channel at most channel_queue_capacity handler runs are in flight,
+    // and further notifications wait in an unbounded FIFO until a run
+    // finishes (capacity 1 = strictly one at a time).
     class PgNotificationMultiplexer {
     public:
         struct Config {
-            size_t channel_queue_capacity;
-            size_t pending_after_disconnect_capacity;
+            size_t channel_queue_capacity;          // handler runs in flight per channel, 0 = no limit
+            size_t pending_after_disconnect_capacity;  // unused: nothing is held back any more
             uint64_t reconnect_backoff_us;
-            uint32_t max_recursive_depth;
-            uint32_t rate_limit_per_sec;
+            uint32_t max_recursive_depth;           // unused: handlers never run nested
+            uint32_t rate_limit_per_sec;            // unused: nothing is dropped any more
 
             constexpr Config(size_t channel_queue_capacity_ = 256,
                              size_t pending_after_disconnect_capacity_ = 1024,
@@ -65,6 +78,14 @@ namespace usub::pg {
             bool wildcard;
         };
 
+        // The dropped_* counters stay 0 (kept for source compatibility).
+        struct Stats {
+            uint64_t dropped_overflow = 0;
+            uint64_t dropped_recursive = 0;
+            uint64_t dropped_rate_limited = 0;
+            uint64_t waiting = 0;  // notifications queued behind the per-channel limit right now
+        };
+
         PgNotificationMultiplexer(std::shared_ptr<PgConnectionLibpq> conn, std::string host,
                                   std::string port, std::string user, std::string db,
                                   std::string password, Config cfg = {}, SSLConfig ssl_config = {},
@@ -76,248 +97,224 @@ namespace usub::pg {
               db_(std::move(db)),
               password_(std::move(password)),
               ssl_config_(ssl_config),
-              cfg_(cfg),
-              keepalive_config_(keepalive_config) {
-            next_handler_id_.store(1, std::memory_order_relaxed);
+              keepalive_config_(keepalive_config),
+              cfg_(cfg) {
         }
 
-        usub::uvent::task::Awaitable<std::optional<HandlerHandle> > add_handler(
-            const std::string &channel, std::shared_ptr<IPgNotifyHandler> handler) {
-            uint64_t hid = next_handler_id_.fetch_add(1, std::memory_order_relaxed);
+        // Subscribes `handler` to `channel`; "a.b.*" is a wildcard over the
+        // channels LISTENed to anyway (no LISTEN of its own). nullopt = the
+        // LISTEN failed and nothing stays registered.
+        usub::uvent::task::Awaitable<std::optional<HandlerHandle> >
+        add_handler(std::string channel, std::shared_ptr<IPgNotifyHandler> handler) {
+            const uint64_t hid = next_handler_id_.fetch_add(1, std::memory_order_relaxed);
 
-            bool is_wild = is_wildcard(channel);
-            if (is_wild) {
-                {
-                    std::lock_guard<std::mutex> lk(state_mtx_);
-                    auto &info = wildcard_[channel];
-                    info.handlers.emplace_back(hid, std::move(handler));
-                }
-                co_return HandlerHandle{hid, channel, true};
+            if (is_wildcard(channel)) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                wildcard_[channel].emplace_back(hid, std::move(handler));
+                co_return HandlerHandle{hid, std::move(channel), true};
             }
 
-            bool first_for_channel = false;
+            bool first = false;
+            std::shared_ptr<Command> cmd;
+            std::vector<std::shared_ptr<Command> > completed;
             {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-                auto &ci = exact_[channel];
-                first_for_channel = ci.handlers.empty();
-                ci.handlers.emplace_back(hid, std::move(handler));
-                ensure_channel_runtime(channel);
-            }
-
-            if (first_for_channel) {
-                if (!(co_await listen_channel(channel))) {
-                    co_return std::nullopt;
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto &handlers = exact_[channel];
+                first = handlers.empty();
+                handlers.emplace_back(hid, std::move(handler));
+                channel_state_locked(channel);
+                if (first && running_) {
+                    cmd = std::make_shared<Command>(channel, true);
+                    commands_.push_back(cmd);
+                    start_next_command_locked(completed);
+                } else if (first) {
+                    ++direct_busy_;
                 }
             }
+            finish_commands(completed);
+            if (!first) co_return HandlerHandle{hid, std::move(channel), false};
 
-            co_return HandlerHandle{hid, channel, false};
+            bool ok = false;
+            if (cmd) {
+                co_await cmd->finished.wait();
+                std::lock_guard<std::mutex> lk(mtx_);
+                ok = cmd->done && cmd->ok;
+            } else {
+                ok = co_await listen_direct(channel);
+                std::lock_guard<std::mutex> lk(mtx_);
+                --direct_busy_;
+            }
+            if (!ok) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    erase_exact_locked(channel, hid, completed);
+                }
+                finish_commands(completed);
+                co_return std::nullopt;
+            }
+            co_return HandlerHandle{hid, std::move(channel), false};
         }
 
+        // The server-side UNLISTEN of a channel left without handlers is
+        // lazy: queued here, sent by the run loop. Until it lands, arriving
+        // notifications find no handler and are dropped.
         bool remove_handler(const HandlerHandle &h) {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            if (h.wildcard) {
-                auto it = wildcard_.find(h.channel);
-                if (it == wildcard_.end()) return false;
-                auto &vec = it->second.handlers;
-                for (auto vit = vec.begin(); vit != vec.end(); ++vit) {
-                    if (vit->first == h.id) {
-                        vec.erase(vit);
-                        if (vec.empty()) {
-                            wildcard_.erase(it);
-                        }
-                        return true;
+            std::vector<std::shared_ptr<Command> > completed;
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (h.wildcard) {
+                    auto it = wildcard_.find(h.channel);
+                    if (it != wildcard_.end()) {
+                        removed = erase_handler(it->second, h.id);
+                        if (it->second.empty()) wildcard_.erase(it);
                     }
-                }
-                return false;
-            }
-
-            auto it = exact_.find(h.channel);
-            if (it == exact_.end()) return false;
-            auto &vec = it->second.handlers;
-            for (auto vit = vec.begin(); vit != vec.end(); ++vit) {
-                if (vit->first == h.id) {
-                    vec.erase(vit);
-                    if (vec.empty()) {
-                        unlisten_channel_sync(h.channel);
-                        exact_.erase(it);
-                        channel_runtime_.erase(h.channel);
-                    }
-                    return true;
+                } else {
+                    removed = erase_exact_locked(h.channel, h.id, completed);
                 }
             }
-            return false;
+            finish_commands(completed);
+            return removed;
         }
 
         bool remove_channel(const std::string &channel) {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            bool is_wild = is_wildcard(channel);
-            if (is_wild) {
-                auto it = wildcard_.find(channel);
-                if (it == wildcard_.end()) return false;
-                wildcard_.erase(it);
-                return true;
+            std::vector<std::shared_ptr<Command> > completed;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (is_wildcard(channel)) return wildcard_.erase(channel) > 0;
+                if (exact_.erase(channel) == 0) return false;
+                channels_.erase(channel);
+                queue_unlisten_locked(channel, completed);
             }
-
-            auto it = exact_.find(channel);
-            if (it == exact_.end()) return false;
-            unlisten_channel_sync(channel);
-            exact_.erase(it);
-            channel_runtime_.erase(channel);
+            finish_commands(completed);
             return true;
         }
 
         usub::uvent::task::Awaitable<void> run() {
-            if (!ensure_connected()) {
-                bool ok = co_await try_reconnect_loop();
-                if (!ok) co_return;
+            // add_handler() calls made before run() own the connection until
+            // their LISTEN is answered.
+            for (;;) {
+                std::vector<std::shared_ptr<Command> > completed;
+                bool started = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (direct_busy_ == 0) {
+                        started = running_ = true;
+                        conn_ready_ = conn_ && conn_->connected();
+                        start_next_command_locked(completed);
+                    }
+                }
+                finish_commands(completed);
+                if (started) break;
+                const bool slept = co_await detail::sleep_for(std::chrono::milliseconds(1));
+                if (!slept) co_return;  // canceled
             }
 
-            start_channel_workers();
-
-            while (true) {
-                if (!conn_ || !conn_->connected()) {
-                    bool ok = co_await try_reconnect_loop();
-                    if (!ok) co_return;
-                    start_channel_workers();
+            std::vector<Notification> batch;
+            std::vector<std::shared_ptr<Command> > completed;
+            for (;;) {
+                bool alive = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    alive = conn_ && conn_->connected();
+                    if (!alive) connection_lost_locked();
                 }
-
-                co_await conn_->wait_readable_for_listener();
-
-                PGconn *raw = conn_->raw_conn();
-                if (!raw) {
+                if (!alive) {
+                    const bool ok = co_await reconnect();
+                    if (!ok) co_return;  // canceled
                     continue;
                 }
 
-                // The poller is edge-triggered, so a single PQconsumeInput per
-                // wakeup is not enough: when a NOTIFY burst is larger than one
-                // read (~16 KiB), the rest stays in the kernel socket buffer,
-                // no new edge ever fires, and the tail of the burst is stuck
-                // until an unrelated notification arrives. Drain the socket
-                // completely before waiting again.
-                for (;;) {
-                    if (PQconsumeInput(raw) == 0) {
-                        break;
-                    }
+                // conn_ is only ever replaced by this loop: no lock needed to
+                // read it here.
+                co_await conn_->wait_readable_for_listener();
+                if (detail::cancel_requested()) co_return;
 
-                    while (true) {
-                        PGnotify *n = PQnotifies(raw);
-                        if (!n) break;
-
-                        const char *ch_raw = n->relname ? n->relname : "";
-                        const char *pl_raw = n->extra ? n->extra : "";
-                        int be_pid = n->be_pid;
-
-                        dispatch_event(ch_raw, pl_raw, be_pid);
-
-                        PQfreemem(n);
-                    }
-
-#ifdef _WIN32
-                    u_long pending = 0;
-                    if (ioctlsocket(PQsocket(raw), FIONREAD, &pending) != 0 || pending == 0) {
-                        break;
-                    }
-#else
-                    int pending = 0;
-                    if (ioctl(PQsocket(raw), FIONREAD, &pending) != 0 || pending <= 0) {
-                        break;
-                    }
-#endif
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    drain_locked(batch, completed);
                 }
+                finish_commands(completed);
+                for (auto &n : batch) dispatch(std::move(n));
+                batch.clear();
             }
-
-            co_return;
         }
 
-        struct Stats {
-            uint64_t dropped_overflow = 0;
-            uint64_t dropped_recursive = 0;
-            uint64_t dropped_rate_limited = 0;
-        };
-
         Stats stats() const {
+            std::lock_guard<std::mutex> lk(mtx_);
             Stats s;
-            for (auto const &kv: channel_runtime_) {
-                s.dropped_overflow += kv.second.dropped_overflow.load(std::memory_order_relaxed);
-                s.dropped_recursive += kv.second.dropped_recursive.load(std::memory_order_relaxed);
-                s.dropped_rate_limited +=
-                        kv.second.dropped_rate_limited.load(std::memory_order_relaxed);
+            for (auto const &kv : channels_) {
+                std::lock_guard<std::mutex> qlk(kv.second->mtx);
+                s.waiting += kv.second->waiting.size();
             }
             return s;
         }
 
     private:
-        struct ChannelInfo {
-            std::vector<std::pair<uint64_t, std::shared_ptr<IPgNotifyHandler> > > handlers;
-        };
+        using Handlers = std::vector<std::pair<uint64_t, std::shared_ptr<IPgNotifyHandler> > >;
 
-        struct WildcardInfo {
-            std::vector<std::pair<uint64_t, std::shared_ptr<IPgNotifyHandler> > > handlers;
-        };
-
-        struct PendingEvent {
+        struct Notification {
             std::string channel;
             std::string payload;
             int pid;
         };
 
-        struct ChannelRuntimeState {
-            usub::queue::concurrent::MPMCQueue<PendingEvent> queue;
-            std::atomic<bool> worker_running{false};
-            std::atomic<uint64_t> dropped_overflow{0};
-            std::atomic<uint64_t> dropped_recursive{0};
-            std::atomic<uint64_t> dropped_rate_limited{0};
-            std::atomic<uint64_t> last_tick_ns{0};
-            std::atomic<uint32_t> tick_count{0};
+        // A LISTEN / UNLISTEN waiting for, or in, its round trip.
+        struct Command {
+            Command(std::string ch, bool l) : channel(std::move(ch)), listen(l) {}
 
-            ChannelRuntimeState(size_t cap) : queue(cap) {
-                last_tick_ns.store(now_ns(), std::memory_order_relaxed);
-                tick_count.store(0, std::memory_order_relaxed);
-            }
-
-            static uint64_t now_ns() {
-                auto n = std::chrono::steady_clock::now().time_since_epoch();
-                return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(n).count();
-            }
-
-            ChannelRuntimeState(const ChannelRuntimeState &) = delete;
-
-            ChannelRuntimeState &operator=(const ChannelRuntimeState &) = delete;
+            std::string channel;
+            bool listen;
+            bool done{false};  // under mtx_
+            bool ok{false};    // under mtx_
+            usub::uvent::sync::AsyncEvent finished{usub::uvent::sync::Reset::Manual};
         };
 
-        inline static thread_local uint32_t tls_dispatch_depth = 0;
-        inline static thread_local std::string tls_last_channel;
-        inline static thread_local std::string tls_last_payload;
+        // A notification and the handlers it was routed to on arrival.
+        struct Delivery {
+            Notification n;
+            std::vector<std::shared_ptr<IPgNotifyHandler> > handlers;
+        };
+
+        // Per channel (exact, or matched by a wildcard): handler runs in
+        // flight and the notifications waiting for a free slot. Shared with
+        // the runs themselves, which start the next waiting notification as
+        // they finish, so it outlives the multiplexer if it has to.
+        struct ChannelQueue {
+            explicit ChannelQueue(size_t l) : limit(l) {}
+
+            std::mutex mtx;
+            std::deque<Delivery> waiting;
+            size_t running{0};
+            const size_t limit;  // 0 = no limit
+        };
 
         static bool is_wildcard(const std::string &ch) {
-            size_t n = ch.size();
-            if (n < 2) return false;
-            if (ch.back() != '*') return false;
-            if (ch[n - 2] != '.') return false;
-            return true;
+            const size_t n = ch.size();
+            return n >= 2 && ch[n - 1] == '*' && ch[n - 2] == '.';
+        }
+
+        static bool wildcard_matches(const std::string &pattern, const std::string &channel) {
+            return channel.compare(0, pattern.size() - 1, pattern, 0, pattern.size() - 1) == 0;
         }
 
         static bool is_simple_ident(const std::string &s) {
             if (s.empty()) return false;
-            unsigned char c0 = (unsigned char) s[0];
+            const unsigned char c0 = static_cast<unsigned char>(s[0]);
             if (!((c0 >= 'a' && c0 <= 'z') || c0 == '_')) return false;
-
             for (size_t i = 1; i < s.size(); ++i) {
-                unsigned char c = (unsigned char) s[i];
-                bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c == '_');
-                if (!ok) return false;
+                const unsigned char c = static_cast<unsigned char>(s[i]);
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
             }
-
             return true;
         }
 
         static std::string quote_ident_channel(const std::string &ch) {
             if (is_simple_ident(ch)) return ch;
-
             std::string out;
             out.reserve(ch.size() + 2);
             out.push_back('"');
-            for (char c: ch) {
+            for (char c : ch) {
                 if (c == '"') out.push_back('"');
                 out.push_back(c);
             }
@@ -325,326 +322,234 @@ namespace usub::pg {
             return out;
         }
 
-        bool ensure_connected() const {
-            if (!conn_) return false;
-            if (!conn_->connected()) return false;
-            return true;
+        static std::string statement(bool listen, const std::string &channel) {
+            return (listen ? "LISTEN " : "UNLISTEN ") + quote_ident_channel(channel) + ";";
         }
 
-        usub::uvent::task::Awaitable<bool> try_reconnect_loop() {
-            using namespace std::chrono_literals;
-
-            for (;;) {
-                auto newConn = std::make_shared<PgConnectionLibpq>();
-
-                auto conninfo = make_conninfo(this->host_, this->port_, this->user_, this->db_, this->password_,
-                                              this->ssl_config_, this->keepalive_config_);
-                if (!conninfo) {
-                    co_await usub::uvent::system::this_coroutine::sleep_for(
-                        std::chrono::microseconds(cfg_.reconnect_backoff_us));
-                    continue;
-                }
-
-                auto err = co_await newConn->connect_async(conninfo.value());
-                if (!err.has_value()) {
-                    conn_ = newConn;
-
-                    bool ok = co_await resubscribe_all();
-                    if (ok) {
-                        flush_pending_after_disconnect();
-                        co_return true;
-                    }
-                }
-
-                co_await usub::uvent::system::this_coroutine::sleep_for(
-                    std::chrono::microseconds(cfg_.reconnect_backoff_us));
-            }
-        }
-
-        usub::uvent::task::Awaitable<bool> resubscribe_all() {
-            std::vector<std::string> names;
-            {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-                names.reserve(exact_.size());
-                for (auto const &kv : exact_) names.push_back(kv.first);
-            }
-            for (auto const &name : names) {
-                std::string sql = "LISTEN " + quote_ident_channel(name) + ";";
-                QueryResult qr = co_await conn_->exec_simple_query_nonblocking(sql);
-                if (!qr.ok) {
-                    co_return false;
-                }
-            }
-            co_return true;
-        }
-
-        void flush_pending_after_disconnect() {
-            std::deque<PendingEvent> drained;
-            {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-                drained.swap(pending_after_disconnect_);
-            }
-            for (auto &ev : drained) {
-                dispatch_event(ev.channel, ev.payload, ev.pid);
-            }
-        }
-
-        usub::uvent::task::Awaitable<bool> listen_channel(const std::string &channel) {
-            std::string sql = "LISTEN " + quote_ident_channel(channel) + ";";
-            QueryResult qr = co_await conn_->exec_simple_query_nonblocking(sql);
-            if (!qr.ok) {
-                co_return false;
-            }
-            co_return true;
-        }
-
-        void unlisten_channel_sync(const std::string &channel) {
-            if (!ensure_connected()) return;
-            std::string sql = "UNLISTEN " + quote_ident_channel(channel) + ";";
-            usub::uvent::system::co_spawn(conn_->exec_simple_query_nonblocking(sql));
-        }
-
-        void ensure_channel_runtime(const std::string &channel) {
-            if (channel_runtime_.find(channel) != channel_runtime_.end()) return;
-
-            channel_runtime_.emplace(std::piecewise_construct, std::forward_as_tuple(channel),
-                                     std::forward_as_tuple(cfg_.channel_queue_capacity));
-        }
-
-        void start_channel_workers() {
-            std::vector<std::string> to_start;
-            {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-                for (auto &kv : channel_runtime_) {
-                    auto &state = kv.second;
-                    bool expected = false;
-                    if (state.worker_running.compare_exchange_strong(
-                            expected, true, std::memory_order_acq_rel,
-                            std::memory_order_relaxed)) {
-                        to_start.push_back(kv.first);
-                    }
-                }
-            }
-            for (auto &ch_copy : to_start) {
-                usub::uvent::system::co_spawn(channel_worker(ch_copy, this));
-            }
-        }
-
-        void dispatch_event(std::string_view ch, std::string_view payload, int pid) {
-            if (!ensure_connected()) {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-                if (pending_after_disconnect_.size() < cfg_.pending_after_disconnect_capacity) {
-                    pending_after_disconnect_.push_back(
-                        PendingEvent{std::string(ch), std::string(payload), pid});
-                }
-                return;
-            }
-
-            ChannelRuntimeState *state_ptr = nullptr;
-            std::string ch_str(ch);
-
-            {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-
-                auto it = channel_runtime_.find(ch_str);
-                if (it == channel_runtime_.end()) {
-                    auto eit = exact_.find(ch_str);
-                    if (eit == exact_.end() && !match_any_wildcard_locked(ch_str)) {
-                        return;
-                    }
-
-                    auto insert_res = channel_runtime_.emplace(
-                        std::piecewise_construct, std::forward_as_tuple(ch_str),
-                        std::forward_as_tuple(cfg_.channel_queue_capacity));
-
-                    it = insert_res.first;
-
-                    bool expected = false;
-                    if (it->second.worker_running.compare_exchange_strong(
-                            expected, true, std::memory_order_acq_rel,
-                            std::memory_order_relaxed)) {
-                        std::string ch_copy2 = it->first;
-                        usub::uvent::system::co_spawn(channel_worker(ch_copy2, this));
-                    }
-                }
-                state_ptr = &it->second;
-            }
-
-            PendingEvent ev{std::move(ch_str), std::string(payload), pid};
-
-            if (!push_rate_limited(*state_ptr, ev)) {
-                state_ptr->dropped_rate_limited.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-
-            if (!state_ptr->queue.try_enqueue(std::move(ev))) {
-                state_ptr->dropped_overflow.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-
-        bool push_rate_limited(ChannelRuntimeState &st, const PendingEvent &) {
-            uint64_t now = ChannelRuntimeState::now_ns();
-            uint64_t last = st.last_tick_ns.load(std::memory_order_relaxed);
-
-            if (now - last > 1000000000ull) {
-                st.last_tick_ns.store(now, std::memory_order_relaxed);
-                st.tick_count.store(1, std::memory_order_relaxed);
-                return true;
-            }
-            for (;;) {
-                uint32_t cur = st.tick_count.load(std::memory_order_relaxed);
-                if (cur >= cfg_.rate_limit_per_sec) {
-                    return false;
-                }
-                if (st.tick_count.compare_exchange_weak(
-                        cur, cur + 1,
-                        std::memory_order_relaxed,
-                        std::memory_order_relaxed)) {
+        static bool erase_handler(Handlers &handlers, uint64_t id) {
+            for (auto it = handlers.begin(); it != handlers.end(); ++it) {
+                if (it->first == id) {
+                    handlers.erase(it);
                     return true;
-                }
-            }
-        }
-
-        static usub::uvent::task::Awaitable<void> channel_worker(std::string channel_name,
-                                                                 PgNotificationMultiplexer *self) {
-            using namespace std::chrono_literals;
-
-            for (;;) {
-                ChannelRuntimeState *st_ptr = nullptr;
-                {
-                    std::lock_guard<std::mutex> lk(self->state_mtx_);
-                    auto it = self->channel_runtime_.find(channel_name);
-                    if (it == self->channel_runtime_.end()) {
-                        co_return;
-                    }
-                    st_ptr = &it->second;
-                }
-
-                PendingEvent ev;
-                if (!st_ptr->queue.try_dequeue(ev)) {
-                    co_await usub::uvent::system::this_coroutine::sleep_for(100us);
-                    continue;
-                }
-
-                self->dispatch_to_handlers_ordered(ev, *st_ptr);
-            }
-
-            co_return;
-        }
-
-        void dispatch_to_handlers_ordered(const PendingEvent &ev, ChannelRuntimeState &st) {
-            if (!check_recursion(ev)) {
-                st.dropped_recursive.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            DispatchDepthGuard depth_guard;
-
-            std::vector<std::shared_ptr<IPgNotifyHandler>> snapshot;
-            {
-                std::lock_guard<std::mutex> lk(state_mtx_);
-
-                auto eit = exact_.find(ev.channel);
-                if (eit != exact_.end()) {
-                    for (auto &pair : eit->second.handlers) {
-                        snapshot.push_back(pair.second);
-                    }
-                }
-
-                for (auto &kv : wildcard_) {
-                    const std::string &pat = kv.first;
-                    if (pat.size() >= 2 && pat.back() == '*' && pat[pat.size() - 2] == '.') {
-                        std::string prefix = pat.substr(0, pat.size() - 1);
-                        if (ev.channel.rfind(prefix, 0) == 0) {
-                            for (auto &pair : kv.second.handlers) {
-                                snapshot.push_back(pair.second);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (snapshot.empty()) {
-                return;
-            }
-
-            for (auto &hptr : snapshot) {
-                std::string ch_copy = ev.channel;
-                std::string pl_copy = ev.payload;
-                int pid_copy = ev.pid;
-                usub::uvent::system::co_spawn(
-                    run_single_handler(hptr, std::move(ch_copy), std::move(pl_copy), pid_copy));
-            }
-        }
-
-        struct DispatchDepthGuard {
-            DispatchDepthGuard() { ++tls_dispatch_depth; }
-            ~DispatchDepthGuard() { --tls_dispatch_depth; }
-            DispatchDepthGuard(const DispatchDepthGuard&) = delete;
-            DispatchDepthGuard& operator=(const DispatchDepthGuard&) = delete;
-        };
-
-        bool check_recursion(const PendingEvent &ev) {
-            if (tls_dispatch_depth >= cfg_.max_recursive_depth) {
-                if (tls_last_channel == ev.channel && tls_last_payload == ev.payload) {
-                    return false;
-                }
-            }
-            tls_last_channel = ev.channel;
-            tls_last_payload = ev.payload;
-            return true;
-        }
-
-        bool match_any_wildcard_locked(const std::string &ch) const {
-            for (auto const &kv: wildcard_) {
-                const std::string &pat = kv.first;
-                if (pat.size() >= 2 && pat.back() == '*' && pat[pat.size() - 2] == '.') {
-                    std::string prefix = pat.substr(0, pat.size() - 1);
-                    if (ch.rfind(prefix, 0) == 0) return true;
                 }
             }
             return false;
         }
 
-        bool match_any_wildcard(const std::string &ch) const {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            return match_any_wildcard_locked(ch);
+        std::shared_ptr<ChannelQueue> channel_state_locked(const std::string &channel) {
+            auto &slot = channels_[channel];
+            if (!slot) slot = std::make_shared<ChannelQueue>(cfg_.channel_queue_capacity);
+            return slot;
         }
 
-        bool get_exact_handlers(const std::string &ch, ChannelInfo *&out) {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            auto it = exact_.find(ch);
-            if (it == exact_.end()) {
-                return false;
+        // Drops handler `id` of an exact channel; the last one out queues
+        // the UNLISTEN. Lock held.
+        bool erase_exact_locked(const std::string &channel, uint64_t id,
+                                std::vector<std::shared_ptr<Command> > &completed) {
+            auto it = exact_.find(channel);
+            if (it == exact_.end() || !erase_handler(it->second, id)) return false;
+            if (it->second.empty()) {
+                exact_.erase(it);
+                channels_.erase(channel);
+                queue_unlisten_locked(channel, completed);
             }
-            out = &it->second;
             return true;
         }
 
-        bool get_wild_handlers(const std::string &ch, std::vector<WildcardInfo *> &out_list) {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            bool any = false;
-            for (auto &kv: wildcard_) {
-                const std::string &pat = kv.first;
-                if (pat.size() >= 2 && pat.back() == '*' && pat[pat.size() - 2] == '.') {
-                    std::string prefix = pat.substr(0, pat.size() - 1);
-                    if (ch.rfind(prefix, 0) == 0) {
-                        out_list.push_back(&kv.second);
-                        any = true;
+        void queue_unlisten_locked(const std::string &channel, std::vector<std::shared_ptr<Command> > &completed) {
+            commands_.push_back(std::make_shared<Command>(channel, false));
+            if (running_) start_next_command_locked(completed);
+        }
+
+        // Sends the next queued statement unless one is in flight or the run
+        // loop has no subscribed connection; the reply wakes the run loop,
+        // which completes it and calls this again. A statement superseded by a
+        // later change of its channel completes without a round trip. Lock
+        // held; finished commands go to `completed`, signalled once the lock
+        // is released (finish_commands).
+        void start_next_command_locked(std::vector<std::shared_ptr<Command> > &completed) {
+            while (!inflight_ && conn_ready_ && !commands_.empty()) {
+                auto cmd = std::move(commands_.front());
+                commands_.pop_front();
+                if (cmd->listen != (exact_.find(cmd->channel) != exact_.end())) {
+                    cmd->ok = cmd->done = true;
+                    completed.push_back(std::move(cmd));
+                    continue;
+                }
+                PGconn *raw = conn_->raw_conn();
+                const std::string sql = statement(cmd->listen, cmd->channel);
+                // A failed send, or a statement of a few dozen bytes the kernel
+                // would not take whole (every earlier one has been answered and
+                // nothing else is ever written), means a broken connection:
+                // shut the socket down so the parked run loop wakes, finds it
+                // dead and reconnects; the statement is sent again afterwards.
+                if (!raw || PQsendQuery(raw, sql.c_str()) == 0 || PQflush(raw) != 0) {
+                    commands_.push_front(std::move(cmd));
+                    conn_ready_ = false;
+                    if (raw && PQsocket(raw) >= 0) ::shutdown(PQsocket(raw), SHUT_RDWR);
+                    return;
+                }
+                inflight_ = std::move(cmd);
+                inflight_ok_ = true;
+            }
+        }
+
+        // Run loop, after a wakeup: what the socket holds goes into libpq,
+        // notifications into `batch`, a finished statement into `completed`.
+        // Lock held.
+        void drain_locked(std::vector<Notification> &batch, std::vector<std::shared_ptr<Command> > &completed) {
+            PGconn *raw = conn_->raw_conn();
+            if (!raw) return;
+            // On failure libpq marks the connection bad; what it parsed before
+            // is still delivered, and the next pass reconnects.
+            (void) PQconsumeInput(raw);
+            while (PGnotify *n = PQnotifies(raw)) {
+                batch.push_back(Notification{n->relname ? n->relname : "", n->extra ? n->extra : "", n->be_pid});
+                PQfreemem(n);
+            }
+            while (inflight_ && !PQisBusy(raw)) {
+                PGresult *r = PQgetResult(raw);
+                if (!r) {
+                    inflight_->ok = inflight_ok_;
+                    inflight_->done = true;
+                    completed.push_back(std::move(inflight_));
+                    inflight_.reset();
+                    break;
+                }
+                if (PQresultStatus(r) != PGRES_COMMAND_OK) inflight_ok_ = false;
+                PQclear(r);
+            }
+            start_next_command_locked(completed);
+        }
+
+        // The connection is gone: the statement in flight is sent again
+        // after the reconnect. Lock held.
+        void connection_lost_locked() {
+            conn_ready_ = false;
+            if (inflight_) {
+                commands_.push_front(std::move(inflight_));
+                inflight_.reset();
+            }
+        }
+
+        static void finish_commands(std::vector<std::shared_ptr<Command> > &completed) {
+            for (auto &c : completed) c->finished.set();
+            completed.clear();
+        }
+
+        // add_handler() before run(): the caller owns the connection.
+        usub::uvent::task::Awaitable<bool> listen_direct(std::string channel) {
+            if (!conn_ || !conn_->connected()) co_return false;
+            const QueryResult qr = co_await conn_->exec_simple_query_nonblocking(statement(true, channel));
+            co_return qr.ok;
+        }
+
+        usub::uvent::task::Awaitable<bool> reconnect() {
+            const auto backoff = std::chrono::microseconds(cfg_.reconnect_backoff_us);
+            std::vector<std::shared_ptr<Command> > completed;
+            for (;;) {
+                auto fresh = std::make_shared<PgConnectionLibpq>();
+                auto conninfo = make_conninfo(host_, port_, user_, db_, password_, ssl_config_, keepalive_config_);
+                if (conninfo) {
+                    auto err = co_await fresh->connect_async(conninfo.value());
+                    if (!err) {
+                        {
+                            std::lock_guard<std::mutex> lk(mtx_);
+                            conn_ = fresh;
+                        }
+                        const bool subscribed = co_await resubscribe_all();
+                        if (subscribed) {
+                            {
+                                std::lock_guard<std::mutex> lk(mtx_);
+                                conn_ready_ = true;
+                                start_next_command_locked(completed);
+                            }
+                            finish_commands(completed);
+                            co_return true;
+                        }
                     }
                 }
+                const bool slept = co_await detail::sleep_for(backoff);
+                if (!slept) co_return false;
             }
-            return any;
         }
 
-        static usub::uvent::task::Awaitable<void> run_single_handler(
-            std::shared_ptr<IPgNotifyHandler> hptr, std::string ch_copy, std::string payload_copy,
-            int pid_copy) {
-            co_await (*hptr)(std::move(ch_copy), std::move(payload_copy), pid_copy);
-            co_return;
+        // Run loop only, while conn_ready_ is false (nobody else sends).
+        usub::uvent::task::Awaitable<bool> resubscribe_all() {
+            std::vector<std::string> names;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                names.reserve(exact_.size());
+                for (auto const &kv : exact_) names.push_back(kv.first);
+            }
+            for (auto const &name : names) {
+                const QueryResult qr = co_await conn_->exec_simple_query_nonblocking(statement(true, name));
+                if (!qr.ok) co_return false;
+            }
+            co_return true;
         }
 
-    private:
+        void dispatch(Notification n) {
+            Delivery d;
+            std::shared_ptr<ChannelQueue> q;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (auto it = exact_.find(n.channel); it != exact_.end())
+                    for (auto &h : it->second) d.handlers.push_back(h.second);
+                for (auto &kv : wildcard_)
+                    if (wildcard_matches(kv.first, n.channel))
+                        for (auto &h : kv.second) d.handlers.push_back(h.second);
+                if (d.handlers.empty()) return;
+                q = channel_state_locked(n.channel);
+            }
+            d.n = std::move(n);
+            std::vector<Delivery> ready;
+            {
+                std::lock_guard<std::mutex> lk(q->mtx);
+                q->waiting.push_back(std::move(d));
+                take_ready_locked(*q, ready);
+            }
+            start(q, ready);
+        }
+
+        // Moves waiting notifications out while the channel has free slots.
+        // Queue lock held.
+        static void take_ready_locked(ChannelQueue &q, std::vector<Delivery> &ready) {
+            while (!q.waiting.empty() && (q.limit == 0 || q.running < q.limit)) {
+                q.running += q.waiting.front().handlers.size();
+                ready.push_back(std::move(q.waiting.front()));
+                q.waiting.pop_front();
+            }
+        }
+
+        static void start(const std::shared_ptr<ChannelQueue> &q, std::vector<Delivery> &ready) {
+            for (auto &d : ready)
+                for (auto &h : d.handlers)
+                    usub::uvent::system::co_spawn(run_handler(h, q, d.n.channel, d.n.payload, d.n.pid));
+            ready.clear();
+        }
+
+        // Detached: everything by value, nothing escapes. A finished run
+        // hands its slot to the next waiting notification.
+        static usub::uvent::task::Awaitable<void>
+        run_handler(std::shared_ptr<IPgNotifyHandler> handler, std::shared_ptr<ChannelQueue> q,
+                    std::string channel, std::string payload, int pid) {
+            try {
+                co_await (*handler)(channel, std::move(payload), pid);
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "[UPQ/notify] handler for channel %s threw: %s\n", channel.c_str(), e.what());
+            } catch (...) {
+                std::fprintf(stderr, "[UPQ/notify] handler for channel %s threw\n", channel.c_str());
+            }
+            std::vector<Delivery> ready;
+            {
+                std::lock_guard<std::mutex> lk(q->mtx);
+                --q->running;
+                take_ready_locked(*q, ready);
+            }
+            start(q, ready);
+        }
+
         std::shared_ptr<PgConnectionLibpq> conn_;
         std::string host_;
         std::string port_;
@@ -655,16 +560,18 @@ namespace usub::pg {
         TCPKeepaliveConfig keepalive_config_;
         Config cfg_;
 
-        std::unordered_map<std::string, ChannelInfo> exact_;
-        std::unordered_map<std::string, WildcardInfo> wildcard_;
+        std::atomic<uint64_t> next_handler_id_{1};
 
-        std::unordered_map<std::string, ChannelRuntimeState> channel_runtime_;
-
-        std::deque<PendingEvent> pending_after_disconnect_;
-
-        std::atomic<uint64_t> next_handler_id_;
-
-        mutable std::mutex state_mtx_;
+        mutable std::mutex mtx_;  // everything below, and every libpq call on conn_ once run() owns it
+        std::unordered_map<std::string, Handlers> exact_;
+        std::unordered_map<std::string, Handlers> wildcard_;
+        std::unordered_map<std::string, std::shared_ptr<ChannelQueue> > channels_;
+        std::deque<std::shared_ptr<Command> > commands_;
+        std::shared_ptr<Command> inflight_;
+        bool inflight_ok_{true};
+        bool running_{false};     // run() owns the connection
+        bool conn_ready_{false};  // ... and it is subscribed: statements may be sent
+        int direct_busy_{0};      // add_handler() LISTENs running before run()
     };
 } // namespace usub::pg
 

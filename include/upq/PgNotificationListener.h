@@ -88,8 +88,8 @@ namespace usub::pg
                     {
                         co_return;
                     }
-                    co_await usub::uvent::system::this_coroutine::sleep_for(
-                        std::chrono::milliseconds(10));
+                    const bool slept = co_await detail::sleep_for(std::chrono::milliseconds(10));
+                    if (!slept) co_return;  // canceled
                     continue;
                 }
 

@@ -292,7 +292,7 @@ namespace usub::pg {
 
     usub::uvent::task::Awaitable<std::pair<std::chrono::milliseconds, uint64_t> >
     PgConnector::probe_replication_lag(PgPool &pool) {
-        auto opt = co_await pool.query_reflect_one<Row>(R"SQL(
+        auto opt = co_await pool.query_reflect_expected_one<Row>(R"SQL(
         SELECT
           COALESCE( (EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000)::bigint, 0 ) AS lag_ms,
           COALESCE( pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())::bigint, 0 ) AS lsn_lag
@@ -334,7 +334,8 @@ namespace usub::pg {
         auto iv = std::chrono::milliseconds{this->cfg_.health.interval_ms ? this->cfg_.health.interval_ms : 500};
         while (true) {
             co_await this->health_tick();
-            co_await usub::uvent::system::this_coroutine::sleep_for(iv);
+            const bool slept = co_await detail::sleep_for(iv);
+            if (!slept) co_return;  // canceled
         }
     }
 

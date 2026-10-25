@@ -1,11 +1,12 @@
 #ifndef PGROWSTREAM_H
 #define PGROWSTREAM_H
 
+#include <cassert>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <cassert>
 
 #include "PgConnection.h"
 #include "PgReflect.h"
@@ -15,6 +16,10 @@
 namespace usub::pg {
     class PgPool;
 
+    // Rows of a server-side cursor, fetched batch_size at a time. Owns the
+    // cursor's transaction and pooled connection when opened by
+    // PgPool::stream(); borrows the connection when opened inside a
+    // PgTransaction. Call close() when done.
     class PgRowStream {
     public:
         using value_type = QueryResult::Row;
@@ -36,36 +41,7 @@ namespace usub::pg {
 
         ~PgRowStream();
 
-        usub::uvent::task::Awaitable<std::optional<QueryResult::Row> > next() {
-            if (!active_) co_return std::nullopt;
-
-            if (buf_idx_ < buf_.size()) {
-                co_return std::move(buf_[buf_idx_++]);
-            }
-
-            if (exhausted_) co_return std::nullopt;
-
-            auto chunk = co_await conn_->cursor_fetch_chunk(cursor_name_, batch_size_);
-            if (!chunk.ok) {
-                err_ = PgOpError{chunk.code, chunk.error, chunk.err_detail};
-                exhausted_ = true;
-                co_return std::nullopt;
-            }
-
-            if (columns_.empty() && !chunk.columns.empty()) {
-                columns_ = std::move(chunk.columns);
-            }
-
-            buf_ = std::move(chunk.rows);
-            buf_idx_ = 0;
-
-            if (buf_.empty()) {
-                exhausted_ = true;
-                co_return std::nullopt;
-            }
-
-            co_return std::move(buf_[buf_idx_++]);
-        }
+        usub::uvent::task::Awaitable<std::optional<QueryResult::Row> > next();
 
         usub::uvent::task::Awaitable<void> close();
 
@@ -87,6 +63,22 @@ namespace usub::pg {
     private:
         friend class PgPool;
         friend class PgTransaction;
+        template<class T>
+        friend class PgTypedRowStream;
+
+        static PgRowStream owning(PgPool *pool, std::shared_ptr<PgConnectionLibpq> conn, std::string cursor,
+                                  uint32_t batch_size);
+
+        static PgRowStream borrowed(std::shared_ptr<PgConnectionLibpq> conn, std::string cursor,
+                                    uint32_t batch_size);
+
+        bool has_buffered() const noexcept { return active_ && buf_idx_ < buf_.size(); }
+
+        QueryResult::Row &pop_buffered() noexcept { return buf_[buf_idx_++]; }
+
+        // FETCHes the next batch into the buffer. False when the cursor is
+        // exhausted or the fetch failed (error() says which).
+        usub::uvent::task::Awaitable<bool> fetch();
 
         void move_from(PgRowStream &&o) noexcept {
             pool_ = o.pool_;
@@ -134,23 +126,14 @@ namespace usub::pg {
         PgTypedRowStream(const PgTypedRowStream &) = delete;
         PgTypedRowStream &operator=(const PgTypedRowStream &) = delete;
 
+        // Next row as T: by column name when every field has a column,
+        // positionally otherwise (std::runtime_error if that fails too).
         usub::uvent::task::Awaitable<std::optional<T> > next() {
-            auto row = co_await inner_.next();
-            if (!row) co_return std::nullopt;
-
-            QueryResult shim{};
-            shim.ok = true;
-            shim.rows_valid = true;
-            shim.columns = inner_.columns();
-            shim.rows.emplace_back(std::move(*row));
-            try {
-                if (!shim.columns.empty()) {
-                    co_return usub::pg::map_single_reflect_named<T>(shim, 0);
-                }
-                co_return usub::pg::map_single_reflect_positional<T>(shim, 0);
-            } catch (const std::exception &) {
-                co_return usub::pg::map_single_reflect_positional<T>(shim, 0);
+            if (!inner_.has_buffered()) {
+                const bool fetched = co_await inner_.fetch();
+                if (!fetched) co_return std::nullopt;
             }
+            co_return map(inner_.pop_buffered());
         }
 
         usub::uvent::task::Awaitable<void> close() { return inner_.close(); }
@@ -162,7 +145,25 @@ namespace usub::pg {
         void set_batch_size(uint32_t n) noexcept { inner_.set_batch_size(n); }
 
     private:
+        T map(const QueryResult::Row &row) {
+            const auto &cols = inner_.columns();
+            if (!plan_ready_) {  // the columns are known once the first batch is in
+                plan_ = detail::make_named_plan<T>(cols, false);
+                plan_ready_ = true;
+            }
+            T dst{};
+            if (plan_.usable && detail::decode_named(plan_, cols, row, dst, nullptr))
+                return dst;
+            dst = T{};
+            std::string err;
+            if (!detail::fill_from_row_positional_ex(row, cols.empty() ? nullptr : &cols, nullptr, dst, &err))
+                throw std::runtime_error(err.empty() ? "decode failed" : err);
+            return dst;
+        }
+
         PgRowStream inner_;
+        detail::NamedPlan<T> plan_{};
+        bool plan_ready_{false};
     };
 }
 

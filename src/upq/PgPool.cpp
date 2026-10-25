@@ -22,11 +22,9 @@ namespace usub::pg {
           , stats_{}
           , retries_on_connection_failed_(retries_on_connection_failed)
           , idle_sem_(0), ssl_config_(std::move(ssl_config)), keepalive_config_(keepalive_config) {
-#if UPQ_POOL_DEBUG
         UPQ_POOL_DBG("ctor: host=%s port=%s user=%s db=%s max_pool=%zu retries=%d",
                      host_.c_str(), port_.c_str(), user_.c_str(), db_.c_str(),
                      max_pool_, retries_on_connection_failed_);
-#endif
     }
 
     PgPool::~PgPool() {
@@ -37,16 +35,16 @@ namespace usub::pg {
     }
 
     void PgPool::close_all() {
-        std::shared_ptr<PgConnectionLibpq> conn;
-        while (this->idle_.try_dequeue(conn)) {
-            if (conn) {
-                conn->close();
-            }
+        ConnPtr conn;
+        while (idle_.try_dequeue(conn)) {
+            if (conn) conn->close();
             conn.reset();
         }
     }
 
-    void PgPool::register_connection(const std::shared_ptr<PgConnectionLibpq> &conn) {
+    // ---------- watchdog ----------
+
+    void PgPool::register_connection(const ConnPtr &conn) {
         std::lock_guard<std::mutex> lk(conns_mtx_);
         conns_.push_back(conn);
     }
@@ -62,9 +60,10 @@ namespace usub::pg {
     usub::uvent::task::Awaitable<void> PgPool::io_watchdog_loop() {
         using namespace std::chrono_literals;
 
-        std::vector<std::shared_ptr<PgConnectionLibpq> > live;
+        std::vector<ConnPtr> live;
         for (;;) {
-            co_await uvent::system::this_coroutine::sleep_for(1000ms);
+            if (!co_await detail::sleep_for(1000ms))
+                co_return;  // canceled
             if (closing_.load(std::memory_order_acquire))
                 co_return;
 
@@ -90,340 +89,294 @@ namespace usub::pg {
                     continue;
                 if (c->abort_io_from_watchdog()) {
                     stats_.io_watchdog_aborts.fetch_add(1, std::memory_order_relaxed);
-#if UPQ_POOL_DEBUG
                     UPQ_POOL_DBG("io watchdog: conn=%p await parked %llu ms, socket shut down",
                                  c.get(), static_cast<unsigned long long>(now - since));
-#endif
                 }
             }
             live.clear();
         }
     }
 
-    usub::uvent::task::Awaitable<std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError> >
+    // ---------- acquire / release ----------
+
+    PgPool::ConnPtr PgPool::take_idle() {
+        ConnPtr conn;
+        while (idle_.try_dequeue(conn)) {
+            stats_.checked.fetch_add(1, std::memory_order_relaxed);
+            if (!conn) continue;
+            if (!conn->connected() || !conn->is_idle()) {
+                // Released connections are idle by construction (see
+                // give_back); anything else is not worth draining here.
+                mark_dead(conn);
+                continue;
+            }
+            if (!conn->idle_socket_alive()) {
+                stats_.stale_dropped.fetch_add(1, std::memory_order_relaxed);
+                mark_dead(conn);
+                continue;
+            }
+            stats_.alive.fetch_add(1, std::memory_order_relaxed);
+            return conn;
+        }
+        return nullptr;
+    }
+
+    usub::uvent::task::Awaitable<std::expected<PgPool::ConnPtr, PgOpError> >
     PgPool::acquire_connection() {
         using namespace std::chrono_literals;
 
         ensure_watchdog_started();
 
-        std::shared_ptr<PgConnectionLibpq> conn;
-
         for (;;) {
-            if (this->idle_.try_dequeue(conn)) {
-                stats_.checked.fetch_add(1, std::memory_order_relaxed);
+            if (ConnPtr conn = take_idle())
+                co_return conn;
 
-                if (!conn) {
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: got null conn from idle queue, dropping");
-#endif
-                    continue;
-                }
-
-                if (!conn->connected()) {
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: got bad idle conn=%p (disconnected), dropping",
-                                 conn.get());
-#endif
-                    mark_dead(conn);
-                    continue;
-                }
-
-                if (!conn->is_idle()) {
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: got non-idle from idle queue conn=%p, trying to drain",
-                                 conn.get());
-#endif
-
-                    bool pumped = co_await conn->pump_input();
-                    if (pumped) {
-                        (void) conn->drain_all_results();
-                    }
-
-                    if (!conn->connected()) {
-#if UPQ_POOL_DEBUG
-                        UPQ_POOL_DBG("acquire: conn=%p disconnected after drain, dropping",
-                                     conn.get());
-#endif
-                        mark_dead(conn);
-                        continue;
-                    }
-
-                    if (!conn->is_idle()) {
-#if UPQ_POOL_DEBUG
-                        UPQ_POOL_DBG("acquire: conn=%p still non-idle after drain, dropping",
-                                     conn.get());
-#endif
-                        mark_dead(conn);
-                        continue;
-                    }
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: conn=%p became idle after drain, reuse", conn.get());
-#endif
-                }
-
-                stats_.alive.fetch_add(1, std::memory_order_relaxed);
-#if UPQ_POOL_DEBUG
-                UPQ_POOL_DBG("acquire: reuse idle conn=%p", conn.get());
-#endif
-
-                co_return std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError>{
-                    std::in_place, std::move(conn)
-                };
-            }
-
-            size_t cur_live = this->live_count_.load(std::memory_order_relaxed);
-            if (cur_live < this->max_pool_) {
-                if (this->live_count_.compare_exchange_strong(
-                    cur_live,
-                    cur_live + 1,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed)) {
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: creating new conn (live=%zu -> %zu)",
-                                 cur_live, cur_live + 1);
-#endif
-
-                    auto newConn = std::make_shared<PgConnectionLibpq>();
-                    register_connection(newConn);
-
-                    auto conninfo = make_conninfo(host_, port_, user_, db_, password_, ssl_config_, this->keepalive_config_);
-                    if (!conninfo)
-                        co_return std::unexpected(PgOpError{
-                            PgErrorCode::ProtocolCorrupt, "conninfo contains NUL", {}
-                        });
-
-                    bool connected = false;
-                    std::optional<std::string> last_err;
-
-                    for (int attempt = 0; attempt < retries_on_connection_failed_; ++attempt) {
-                        auto err = co_await newConn->connect_async(conninfo.value());
-                        if (!err.has_value()) {
-                            connected = true;
-                            break;
-                        }
-
-                        last_err = err;
-#if UPQ_POOL_DEBUG
-                        UPQ_POOL_DBG("acquire: new conn=%p connect_async failed (attempt %d/%d): %s",
-                                     newConn.get(),
-                                     attempt + 1,
-                                     retries_on_connection_failed_,
-                                     err->c_str());
-#endif
-
-                        if (attempt + 1 < retries_on_connection_failed_)
-                            co_await uvent::system::this_coroutine::sleep_for(100ms);
-                    }
-
-                    if (!connected) {
-                        stats_.reconnected.fetch_add(1, std::memory_order_relaxed);
-                        mark_dead(newConn);
-
-                        std::string msg = "Connection failed after retries";
-                        if (last_err) {
-                            msg += ": ";
-                            msg += *last_err;
-                        }
-
-                        co_return std::unexpected(PgOpError{
-                            PgErrorCode::TooManyConnections,
-                            std::move(msg),
-                            {}
-                        });
-                    }
-#if UPQ_POOL_DEBUG
-                    UPQ_POOL_DBG("acquire: new conn=%p ready", newConn.get());
-#endif
-                    co_return std::expected<std::shared_ptr<PgConnectionLibpq>, PgOpError>{
-                        std::in_place, std::move(newConn)
-                    };
-                }
+            size_t live = live_count_.load(std::memory_order_relaxed);
+            if (live >= max_pool_) {
+                UPQ_POOL_DBG("acquire: no idle and at max live=%zu, waiting on idle_sem", live);
+                if (!co_await detail::acquire(idle_sem_))
+                    co_return std::unexpected(PgOpError{PgErrorCode::AwaitCanceled, "acquire canceled", {}});
                 continue;
             }
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("acquire: no idle and at max live=%zu, waiting on idle_sem", cur_live);
-#endif
-            co_await idle_sem_.acquire();
+            if (!live_count_.compare_exchange_strong(live, live + 1, std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed))
+                continue;
+
+            UPQ_POOL_DBG("acquire: creating new conn (live=%zu -> %zu)", live, live + 1);
+            auto conn = std::make_shared<PgConnectionLibpq>();
+            register_connection(conn);
+
+            auto conninfo = make_conninfo(host_, port_, user_, db_, password_, ssl_config_, keepalive_config_);
+            if (!conninfo) {
+                mark_dead(conn);
+                co_return std::unexpected(PgOpError{PgErrorCode::ProtocolCorrupt, "conninfo contains NUL", {}});
+            }
+
+            std::optional<std::string> last_err;
+            for (int attempt = 0; attempt < retries_on_connection_failed_; ++attempt) {
+                last_err = co_await conn->connect_async(conninfo.value());
+                if (!last_err) co_return conn;
+
+                UPQ_POOL_DBG("acquire: new conn=%p connect_async failed (attempt %d/%d): %s", conn.get(),
+                             attempt + 1, retries_on_connection_failed_, last_err->c_str());
+                if (attempt + 1 == retries_on_connection_failed_) break;
+                if (!co_await detail::sleep_for(100ms)) break;  // canceled
+            }
+
+            stats_.reconnected.fetch_add(1, std::memory_order_relaxed);
+            mark_dead(conn);
+            std::string msg = "Connection failed after retries";
+            if (last_err) msg.append(": ").append(*last_err);
+            co_return std::unexpected(PgOpError{PgErrorCode::TooManyConnections, std::move(msg), {}});
         }
     }
 
-    void PgPool::release_connection(std::shared_ptr<PgConnectionLibpq> conn) {
-        if (!conn)
-            return;
+    void PgPool::release_connection(ConnPtr conn) {
+        if (!conn) return;
+        conn->set_io_deadline_ms(0);
 
         if (!conn->connected() || !conn->is_idle()) {
-#if UPQ_POOL_DEBUG
             UPQ_POOL_DBG("release: conn=%p not idle or disconnected, mark_dead", conn.get());
-#endif
             mark_dead(conn);
             return;
         }
-
-        if (!this->idle_.try_enqueue(conn)) {
-#if UPQ_POOL_DEBUG
+        if (!idle_.try_enqueue(conn)) {
             UPQ_POOL_DBG("release: idle queue full for conn=%p, mark_dead", conn.get());
-#endif
             mark_dead(conn);
-        } else {
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("release: enqueued conn=%p", conn.get());
-#endif
-            idle_sem_.release();
+            return;
         }
+        idle_sem_.release();
     }
 
     usub::uvent::task::Awaitable<void>
-    PgPool::release_connection_async(std::shared_ptr<PgConnectionLibpq> conn) {
-        if (!conn) {
-            co_return;
-        }
+    PgPool::release_connection_async(ConnPtr conn) {
+        if (!conn) co_return;
         // A transaction-scoped IO deadline (PgTransaction::set_io_deadline_ms)
         // must not outlive its transaction: whoever gets this connection next
         // starts from the connection default.
         conn->set_io_deadline_ms(0);
 
-        if (!conn->connected()) {
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("release_async: conn=%p disconnected, mark_dead", conn.get());
-#endif
-            mark_dead(conn);
-            co_return;
+        if (conn->connected() && !conn->is_idle()) {
+            // Unread results of a statement nobody waited for: read them off
+            // so the connection can be reused.
+            if (co_await conn->pump_input()) conn->discard_pending_results();
         }
-
-        bool pumped = co_await conn->pump_input();
-        if (pumped) {
-            (void) conn->drain_all_results();
-        }
-
-        if (!conn->connected() || !conn->is_idle()) {
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("release_async: conn=%p not idle or disconnected after drain, mark_dead",
-                         conn.get());
-#endif
-            mark_dead(conn);
-            co_return;
-        }
-
-        if (!this->idle_.try_enqueue(conn)) {
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("release_async: idle queue full for conn=%p, mark_dead", conn.get());
-#endif
-            mark_dead(conn);
-        } else {
-#if UPQ_POOL_DEBUG
-            UPQ_POOL_DBG("release_async: enqueued conn=%p", conn.get());
-#endif
-            idle_sem_.release();
-        }
-
-        co_return;
+        release_connection(std::move(conn));
     }
 
-    usub::uvent::task::Awaitable<void>
-    PgPool::transient_backoff(int attempt, const char *sqlstate) {
-        stats_.transient_retries.fetch_add(1, std::memory_order_relaxed);
-
-        unsigned delay_ms = transient_retry_base_ms_;
-        for (int i = 0; i < attempt; ++i)
-            delay_ms *= 3;
-
-        std::fprintf(stderr,
-                     "[UPQ/pool] transient backend error (sqlstate %s) db=%s user=%s, "
-                     "retry %d/%d in %ums\n",
-                     sqlstate && *sqlstate ? sqlstate : "?",
-                     db_.c_str(), user_.c_str(),
-                     attempt + 1, transient_retry_attempts_ - 1, delay_ms);
-
-        co_await uvent::system::this_coroutine::sleep_for(
-            std::chrono::milliseconds(delay_ms));
-        co_return;
+    bool PgPool::give_back(ConnPtr const &conn, const QueryResult &qr, RetryClass cls) {
+        const bool conn_failed = cls == RetryClass::NotStarted || cls == RetryClass::ConnectionLost ||
+                                 cls == RetryClass::Deadline || is_fatal_connection_error(qr);
+        if (conn_failed || !conn->connected()) {
+            mark_dead(conn);
+            return true;
+        }
+        if (!conn->is_idle()) return false;
+        release_connection(conn);
+        return true;
     }
 
-    void PgPool::mark_dead(std::shared_ptr<PgConnectionLibpq> const &conn) {
-        if (!conn)
-            return;
+    void PgPool::mark_dead(ConnPtr const &conn) {
+        if (!conn) return;
 
         bool expected = false;
-        if (!conn->dead_accounted_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-#if UPQ_POOL_DEBUG
+        if (!conn->dead_accounted_.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                           std::memory_order_relaxed)) {
             UPQ_POOL_DBG("mark_dead: conn=%p already accounted, skipping", conn.get());
-#endif
             conn->close();
             return;
         }
 
-#if UPQ_POOL_DEBUG
         UPQ_POOL_DBG("mark_dead: conn=%p", conn.get());
-#endif
         conn->close();
-        this->live_count_.fetch_sub(1, std::memory_order_relaxed);
+        live_count_.fetch_sub(1, std::memory_order_relaxed);
         idle_sem_.release();
     }
+
+    // ---------- retries ----------
+
+    std::optional<unsigned> PgPool::next_retry_delay(RetryBudget &b, RetryClass cls, RetryScope scope) const {
+        const QueryOpts &o = b.opts;
+        // May the failure class be re-run at all in this scope?
+        bool allowed = false;
+        switch (cls) {
+            case RetryClass::NotStarted:
+                allowed = true;
+                break;
+            case RetryClass::ConnectionLost:
+                allowed = scope == RetryScope::Transaction || o.idempotent ||
+                          (scope == RetryScope::Statement && o.retry_on_connection_loss);
+                break;
+            case RetryClass::Deadline:
+                allowed = scope == RetryScope::Transaction || o.idempotent;
+                break;
+            case RetryClass::RolledBack:
+                allowed = scope != RetryScope::Statement || o.idempotent;
+                break;
+            case RetryClass::None:
+                break;
+        }
+        if (!allowed) return std::nullopt;
+
+        std::optional<unsigned> delay;
+        switch (cls) {
+            case RetryClass::NotStarted:
+                if (b.attempt + 1 < transient_retry_attempts_) {
+                    unsigned ms = transient_retry_base_ms_;
+                    for (int i = 0; i < b.attempt; ++i) ms *= 3;
+                    delay = ms;
+                }
+                break;
+            case RetryClass::ConnectionLost:
+                if (b.connection_lost++ == 0) delay = 0u;  // a socket died; nothing to wait for
+                break;
+            case RetryClass::Deadline:
+                if (b.deadline++ == 0) delay = 0u;
+                break;
+            case RetryClass::RolledBack:
+                if (b.rolled_back < transient_retry_attempts_ - 1)
+                    delay = 50u << b.rolled_back++;  // 50, 100, 200 ms: let the competitor finish
+                break;
+            case RetryClass::None:
+                break;
+        }
+        if (delay && o.retry_budget_ms &&
+            PgConnectionLibpq::steady_now_ms() + *delay >= b.started_ms + o.retry_budget_ms)
+            delay.reset();
+        return delay;
+    }
+
+    void PgPool::note_retry(RetryEvent ev) {
+        ev.db = db_;
+        ev.user = user_;
+        switch (ev.cls) {
+            case RetryClass::NotStarted: stats_.transient_retries.fetch_add(1, std::memory_order_relaxed); break;
+            case RetryClass::ConnectionLost: stats_.connection_loss_retries.fetch_add(1, std::memory_order_relaxed); break;
+            case RetryClass::Deadline: stats_.deadline_retries.fetch_add(1, std::memory_order_relaxed); break;
+            case RetryClass::RolledBack: stats_.rollback_retries.fetch_add(1, std::memory_order_relaxed); break;
+            case RetryClass::None: break;
+        }
+
+        if (retry_observer_) {
+            retry_observer_(ev);
+            return;
+        }
+
+        const std::string sqlstate(ev.sqlstate.empty() ? std::string_view("?") : ev.sqlstate);
+        if (ev.cls == RetryClass::NotStarted && !ev.in_transaction) {
+            std::fprintf(stderr,
+                         "[UPQ/pool] transient backend error (sqlstate %s) db=%s user=%s, "
+                         "retry %d/%d in %ums\n",
+                         sqlstate.c_str(), db_.c_str(), user_.c_str(), ev.attempt, transient_retry_attempts_ - 1,
+                         ev.delay_ms);
+            return;
+        }
+        // libpq messages span several lines; keep the log line grep-able.
+        std::string msg;
+        msg.reserve(ev.message.size());
+        for (const char ch : ev.message) {
+            const bool space = ch == '\n' || ch == '\t' || ch == '\r' || ch == ' ';
+            if (space && (msg.empty() || msg.back() == ' ')) continue;
+            msg.push_back(space ? ' ' : ch);
+        }
+        if (!msg.empty() && msg.back() == ' ') msg.pop_back();
+        std::fprintf(stderr, "[UPQ/pool] %s retry %d after %s (code %s, sqlstate %s) db=%s user=%s in %ums: %s\n",
+                     ev.in_transaction ? "transaction" : "statement", ev.attempt, toString(ev.cls),
+                     toString(ev.code), sqlstate.c_str(), db_.c_str(), user_.c_str(), ev.delay_ms, msg.c_str());
+    }
+
+    usub::uvent::task::Awaitable<bool>
+    PgPool::transient_backoff(int attempt, const char *sqlstate) {
+        unsigned delay_ms = transient_retry_base_ms_;
+        for (int i = 0; i < attempt; ++i) delay_ms *= 3;
+        note_retry(RetryEvent{RetryClass::NotStarted, attempt + 1, delay_ms, PgErrorCode::ServerError,
+                              sqlstate ? std::string_view(sqlstate) : std::string_view{}, {}, {}, {}, false});
+        const bool slept = co_await detail::sleep_for(std::chrono::milliseconds(delay_ms));
+        co_return slept;
+    }
+
+    // ---------- cursors / COPY ----------
 
     usub::uvent::task::Awaitable<std::expected<PgRowStream, PgOpError> >
     PgPool::stream(std::string sql, uint32_t batch_size) {
         auto c = co_await acquire_connection();
         if (!c) co_return std::unexpected(c.error());
+        ConnPtr conn = std::move(*c);
 
-        auto conn = *c;
-        const std::string cursor_name = conn->make_cursor_name();
-
-        {
-            QueryResult r = co_await conn->exec_simple_query_nonblocking("BEGIN;");
-            if (!r.ok) {
-                PgOpError err{r.code, r.error, r.err_detail};
-                if (is_fatal_connection_error(r)) mark_dead(conn);
-                else co_await release_connection_async(conn);
-                co_return std::unexpected(std::move(err));
-            }
+        QueryResult r = co_await conn->exec_simple_query_nonblocking("BEGIN;");
+        if (r.ok) {
+            const std::string cursor_name = conn->make_cursor_name();
+            r = co_await conn->cursor_declare_in_tx(cursor_name, sql);
+            if (r.ok) co_return PgRowStream::owning(this, std::move(conn), cursor_name, batch_size);
+            if (!is_fatal_connection_error(r)) co_await conn->exec_simple_query_nonblocking("ROLLBACK;");
         }
+        if (is_fatal_connection_error(r)) mark_dead(conn);
+        else co_await release_connection_async(std::move(conn));
+        co_return std::unexpected(detail::to_op_error(r));
+    }
 
-        {
-            QueryResult r = co_await conn->cursor_declare_in_tx(cursor_name, sql);
-            if (!r.ok) {
-                PgOpError err{r.code, r.error, r.err_detail};
-                if (is_fatal_connection_error(r)) {
-                    mark_dead(conn);
-                } else {
-                    co_await conn->exec_simple_query_nonblocking("ROLLBACK;");
-                    co_await release_connection_async(conn);
-                }
-                co_return std::unexpected(std::move(err));
-            }
-        }
+    PgCopyResult PgPool::copy_error(const PgOpError &e) {
+        PgCopyResult bad{};
+        bad.ok = false;
+        bad.code = e.code;
+        bad.error = e.error;
+        bad.err_detail = e.err_detail;
+        return bad;
+    }
 
-        PgRowStream s;
-        s.pool_ = this;
-        s.conn_ = std::move(conn);
-        s.cursor_name_ = cursor_name;
-        s.batch_size_ = batch_size ? batch_size : 1;
-        s.owns_tx_ = true;
-        s.active_ = true;
-        s.exhausted_ = false;
-        co_return std::expected<PgRowStream, PgOpError>{std::in_place, std::move(s)};
+    usub::uvent::task::Awaitable<void> PgPool::give_back_copy(ConnPtr const &conn, const PgCopyResult &r) {
+        if (!r.ok && (r.code == PgErrorCode::SocketReadFailed || r.code == PgErrorCode::ConnectionClosed))
+            mark_dead(conn);
+        else
+            co_await release_connection_async(conn);
     }
 
     usub::uvent::task::Awaitable<PgCopyResult>
     PgPool::copy_from_buffer(std::string sql, const void *data, size_t len) {
         auto c = co_await acquire_connection();
-        if (!c) {
-            const auto &e = c.error();
-            PgCopyResult bad{};
-            bad.ok = false;
-            bad.code = e.code;
-            bad.error = e.error;
-            bad.err_detail = e.err_detail;
-            co_return bad;
-        }
-        auto conn = *c;
-        PgCopyResult r = co_await conn->copy_from_buffer(sql, data, len);
-        if (!r.ok && (r.code == PgErrorCode::SocketReadFailed ||
-                      r.code == PgErrorCode::ConnectionClosed)) {
-            mark_dead(conn);
-        } else {
-            co_await release_connection_async(conn);
-        }
+        if (!c) co_return copy_error(c.error());
+        PgCopyResult r = co_await (*c)->copy_from_buffer(sql, data, len);
+        co_await give_back_copy(*c, r);
         co_return r;
     }
 } // namespace usub::pg

@@ -1,21 +1,19 @@
 # PgNotificationMultiplexer
 
 `PgNotificationMultiplexer` listens to many PostgreSQL `LISTEN` channels on **one** dedicated connection and dispatches
-notifications to registered handlers asynchronously. Supports wildcards, per-channel queues, rate limiting, and
-auto-reconnect with resubscribe.
+notifications to registered handlers asynchronously. Supports wildcards, per-channel concurrency limits with an
+unbounded queue (nothing is dropped), and auto-reconnect with resubscribe.
 
 ---
 
 ## Key features
 
 - **One connection, many channels** (exact and wildcard `prefix.*`)
-- **Multiple handlers per channel**
-- **Per-channel MPMC queues** with capacity limits
-- **Rate limiting** per channel (`rate_limit_per_sec`)
-- **Auto-reconnect** with exponential polling and **resubscribe**
-- **Pending buffer** for events seen during disconnect
-- **Recursion guard** to avoid handler self-loops
-- **Drop counters**: overflow / recursion / rate-limit
+- **Multiple handlers per channel**, added and removed at any time, also while `run()` is active
+- **Nothing is dropped**: an unbounded FIFO per channel behind a limit of handler runs in flight
+  (`channel_queue_capacity`)
+- **Auto-reconnect** with **resubscribe**
+- **No cost while idle**: the run loop sleeps on the socket, nothing polls
 
 ---
 
@@ -50,11 +48,11 @@ usub::uvent::task::Awaitable<void> start_mux()
     PgNotificationMultiplexer mux{
         conn, "127.0.0.1", "5432", "postgres", "app", "secret",
         PgNotificationMultiplexer::Config{
-            /*channel_queue_capacity*/             1024,
-            /*pending_after_disconnect_capacity*/  2048,
+            /*channel_queue_capacity*/             1024,   // handler runs in flight per channel
+            /*pending_after_disconnect_capacity*/  2048,   // unused
             /*reconnect_backoff_us*/               100'000,
-            /*max_recursive_depth*/                4,
-            /*rate_limit_per_sec*/                 10'000
+            /*max_recursive_depth*/                4,      // unused
+            /*rate_limit_per_sec*/                 10'000  // unused
         }
     };
 
@@ -81,38 +79,52 @@ usub::uvent::task::Awaitable<void> start_mux()
 
 ---
 
-## Backpressure & drops
+## Subscriptions while running
 
-Each channel has its own queue with fixed capacity. When full, events are dropped and counted:
+Before `run()`, `add_handler()` sends its `LISTEN` itself; such calls must not overlap (await one before the next).
+Once `run()` is active it is the only reader of the connection: a new subscription is queued, its `LISTEN` is sent
+right away when the connection is free (otherwise after the statement in flight), and `add_handler()` returns when the
+run loop has read the reply. `nullopt` means the `LISTEN` failed and the handler is not registered.
 
-* `dropped_overflow` — queue full
-* `dropped_rate_limited` — exceeded `rate_limit_per_sec`
-* `dropped_recursive` — recursion guard blocked the event
+Removing the last handler of a channel queues its `UNLISTEN` the same way, without waiting for it: notifications that
+arrive before it lands find no handler and are dropped. A later `add_handler()` for the same channel supersedes a
+queued `UNLISTEN`.
 
-Read aggregate counters:
+All of this is safe from any worker: every libpq call on the connection happens under the multiplexer's mutex, in
+short sections that never suspend.
+
+## Backpressure
+
+Nothing that reaches the multiplexer is dropped. Every notification is handed to each matching handler (resolved when
+it arrives) in a detached coroutine of its own, started in arrival order. Per channel at most
+`channel_queue_capacity` handler runs are in flight; further notifications wait in an unbounded FIFO and start as
+runs finish — no polling, a finishing run starts the next one.
+
+* `channel_queue_capacity = 1` — strictly one notification at a time, in order;
+* `channel_queue_capacity = 0` — no limit, every notification starts at once.
+
+`Stats::waiting` is the number of notifications queued right now. The `dropped_*` counters stay 0, and
+`pending_after_disconnect_capacity`, `max_recursive_depth` and `rate_limit_per_sec` are unused; all are kept for
+source compatibility. A queue that keeps growing means the handlers are slower than the notification rate.
+
+Notifications sent while the listener is disconnected are never seen (PostgreSQL does not keep them for a session
+that is gone): state that must not be missed needs a reconciliation pass after a reconnect.
 
 ```cpp
 PgNotificationMultiplexer::Stats s = mux.stats();
-std::cout << "overflow=" << s.dropped_overflow
-          << " recursive=" << s.dropped_recursive
-          << " rate_limited=" << s.dropped_rate_limited << "\n";
+std::cout << "waiting=" << s.waiting << "\n";
 ```
 
 ---
 
 ## Reconnect behavior
 
-* On disconnect, the mux retries `connect_async` using provided host/port/user/db/password with `sslmode=disable`.
-* After reconnect it **resubscribes** to all exact channels and **flushes** buffered pending events.
+* On disconnect, the mux retries `connect_async` every `reconnect_backoff_us` with the host/port/user/db/password and
+  the SSL / keepalive settings given to the constructor. Pass the real password: `PgPool::password()` only returns
+  `"***"`, and a reconnect with it never succeeds.
+* After reconnect it **resubscribes** to all exact channels and sends the subscription changes queued meanwhile.
 * Wildcard registrations are kept in memory and continue to match.
-
----
-
-## Recursion guard
-
-Per-thread guard prevents infinite loops if handlers `NOTIFY` back the same `(channel,payload)` repeatedly.
-Depth limit is `max_recursive_depth`. Beyond that, identical `(channel,payload)` are dropped and counted as
-`dropped_recursive`.
+* `run()` returns when its task is canceled.
 
 ---
 
@@ -128,11 +140,11 @@ struct IPgNotifyHandler {
 };
 
 struct PgNotificationMultiplexer::Config {
-    size_t   channel_queue_capacity              = 256;
-    size_t   pending_after_disconnect_capacity   = 1024;
+    size_t   channel_queue_capacity              = 256;      // handler runs in flight per channel, 0 = no limit
+    size_t   pending_after_disconnect_capacity   = 1024;     // unused
     uint64_t reconnect_backoff_us                = 100'000;
-    uint32_t max_recursive_depth                 = 4;
-    uint32_t rate_limit_per_sec                  = 1000;
+    uint32_t max_recursive_depth                 = 4;        // unused
+    uint32_t rate_limit_per_sec                  = 1000;     // unused
 };
 
 struct PgNotificationMultiplexer::HandlerHandle {
@@ -142,9 +154,10 @@ struct PgNotificationMultiplexer::HandlerHandle {
 };
 
 struct PgNotificationMultiplexer::Stats {
-    uint64_t dropped_overflow;
-    uint64_t dropped_recursive;
-    uint64_t dropped_rate_limited;
+    uint64_t dropped_overflow;      // always 0
+    uint64_t dropped_recursive;     // always 0
+    uint64_t dropped_rate_limited;  // always 0
+    uint64_t waiting;               // notifications queued behind the per-channel limit
 };
 ```
 
@@ -166,19 +179,20 @@ PgNotificationMultiplexer(
 
 | Method                                                                                                                                                                                                                       |
 |------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `task::Awaitable<std::optional<HandlerHandle>> add_handler(const std::string& channel, std::shared_ptr<IPgNotifyHandler> handler)` — Registers handler; `LISTEN` for exact channels; returns handle or `nullopt` on failure. |
-| `bool remove_handler(const HandlerHandle& h)` — Unregisters a specific handler; for exact channels, does `UNLISTEN` and tears down the channel when the last handler is removed.                                             |
-| `bool remove_channel(const std::string& channel)` — Removes all handlers for the channel; exact channels are `UNLISTEN`ed.                                                                                                   |
-| `task::Awaitable<void> run()` — Main loop; consumes `PGnotify`, routes to per-channel workers, handles reconnects.                                                                                                           |
-| `Stats stats() const` — Aggregate drop counters across all channels.                                                                                                                                                         |
+| `task::Awaitable<std::optional<HandlerHandle>> add_handler(std::string channel, std::shared_ptr<IPgNotifyHandler> handler)` — Registers handler; `LISTEN` for exact channels; returns handle or `nullopt` on failure (nothing stays registered). |
+| `bool remove_handler(const HandlerHandle& h)` — Unregisters a specific handler; for exact channels, queues the `UNLISTEN` when the last handler is removed.                                             |
+| `bool remove_channel(const std::string& channel)` — Removes all handlers for the channel; exact channels are `UNLISTEN`ed (queued).                                                                   |
+| `task::Awaitable<void> run()` — Main loop; consumes `PGnotify`, completes subscription changes, dispatches to handlers, handles reconnects.                                                          |
+| `Stats stats() const` — Notifications waiting across all channels (the drop counters stay 0).                                                                                                                              |
 
 ---
 
 ## Handler execution model
 
-* Delivery order per channel is FIFO by queueing point.
-* Each handler call is `co_spawn`’d; slow handlers don’t block the reader.
-* Handlers **must** be resilient (no throws; handle their own failures).
+* Handler runs start in arrival order; each one is `co_spawn`’d, so slow handlers don’t block the reader (they only
+  hold back later notifications of their channel once `channel_queue_capacity` runs are in flight).
+* An exception escaping a handler is caught and printed to stderr (`[UPQ/notify] handler for channel … threw`);
+  handle failures inside the handler.
 
 ---
 
